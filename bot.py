@@ -836,19 +836,36 @@ async def submit_grade_evaluation(
     val_str = format_score(parsed["value"])
 
     if is_update:
-        msg = (
-            f"✏️ {대상.mention}님에 대한 등급 평가를 수정했습니다:\n"
-            f"`{prev_grade}` ({prev_val}점) ➡️ **`{parsed['display_code']}` ({parsed['role_name']} 계열, {val_str}점)**\n"
-            f"*(현재 이 유저를 평가한 인원: {total_evaluators}명)*"
+        private_msg = (
+            f"✏️ **[본인 확인용]** {대상.mention}님에 대한 등급 평가를 수정했습니다:\n"
+            f"`{prev_grade}` ({prev_val}점) ➡️ **`{parsed['display_code']}` ({parsed['role_name']} 계열, {val_str}점)**"
+        )
+        public_msg = (
+            f"🗳️ {user.mention}님이 {대상.mention}님에 대한 등급 평가를 수정했습니다. "
+            f"*(현재 {total_evaluators}명 참여)*"
         )
     else:
-        msg = (
-            f"✅ {대상.mention}님에 대한 등급 평가를 제출했습니다:\n"
-            f"**`{parsed['display_code']}` ({parsed['role_name']} 계열, {val_str}점)**\n"
-            f"*(현재 이 유저를 평가한 인원: {total_evaluators}명)*"
+        private_msg = (
+            f"✅ **[본인 확인용]** {대상.mention}님에 대한 등급 평가를 제출했습니다:\n"
+            f"**`{parsed['display_code']}` ({parsed['role_name']} 계열, {val_str}점)**"
+        )
+        public_msg = (
+            f"🗳️ {user.mention}님이 {대상.mention}님에 대한 등급 평가를 완료했습니다. "
+            f"*(현재 {total_evaluators}명 참여)*"
         )
 
-    await interaction.response.send_message(msg, ephemeral=True)
+    # 1) 평가자 본인에게는 부여한 등급/점수가 포함된 비공개(ephemeral) 확인 메시지 표시
+    await interaction.response.send_message(private_msg, ephemeral=True)
+
+    # 2) 채널의 모든 사람에게는 결과(등급/점수) 없이 투표 완료 사실만 공개 메시지로 전송
+    if interaction.channel is not None:
+        try:
+            await interaction.channel.send(
+                public_msg,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException as e:
+            logger.warning(f"투표 완료 공개 메시지 전송 실패: {e}")
 
 
 # =====================================================================
