@@ -1,0 +1,96 @@
+# AI 에이전트 작업 지침 (CLAUDE.md / AGENTS.md)
+
+이 저장소(`Chris-bot`)를 읽는 모든 AI(Claude, Antigravity 등)는 아래 규칙과 서버 환경을 반드시 숙지하고 작업해야 합니다.
+
+---
+
+## 1. 주인(사용자)과 일하는 법
+
+- 주인은 한국인이고 개발자가 아닙니다. **한국어 존댓말**로, 짧고 정확한 단계로 안내합니다.
+- **봇 토큰 · API 키 · 비밀번호는 절대 채팅에 붙여 넣게 하지 않습니다.**
+  서버의 어느 파일(`/opt/bots/Chris-bot/.env`), 어느 줄에 넣을지 알려 주고 주인이 직접 넣게 안내합니다 (예: `nano /opt/bots/Chris-bot/.env`).
+- 같은 봇 토큰으로 두 곳(이 서버와 집 PC 등)에서 동시에 돌리면 명령에 두 번 답합니다. 한 곳에서만 돌립니다.
+- 서버에 무언가 설치하거나 서비스를 켜거나 재시작하기 전에, 무엇을 할지 먼저 알려 주고 동의를 받습니다.
+- 기능을 추가하거나 수정할 때마다 변경 사항을 **GitHub 저장소에 commit & push** 하여 다음 AI 세션에서도 최신 상태를 참고할 수 있게 유지합니다.
+
+---
+
+## 2. `bot2` 서버 정보 (오라클 클라우드 무료 서버)
+
+| 항목 | 값 |
+|---|---|
+| 이름 | `bot2` (오라클 클라우드, 오사카 `ap-osaka-1`) |
+| 종류 | `VM.Standard.E2.1.Micro` (Always Free, x86) — CPU 1/8 OCPU, **메모리 1GB** |
+| 스왑 | 2GB (`/swapfile`, fstab 등록됨) |
+| 디스크 | 50GB |
+| OS | Ubuntu 24.04, 사용자 `ubuntu` (sudo 가능), 시간대 UTC |
+| 공인 IP | `161.33.0.94` |
+| 런타임 | Python 3.12 기본 설치됨 |
+
+### 접속 방법 (주인의 PC `C:\Users\tntma` 에서만 가능)
+```bash
+ssh -i ~/.ssh/gfx_oracle -o BatchMode=yes ubuntu@161.33.0.94
+```
+- 열쇠 `~/.ssh/gfx_oracle` 내용은 절대 출력하거나 옮기지 않습니다.
+- `129.225.132.54` (`gfxref`) 서버는 별개 서버이므로 **절대 건드리지 않습니다.**
+
+---
+
+## 3. `Chris-bot` 서버 설치 및 업데이트 표준 절차
+
+### 최초 설치 시 (`/opt/bots/Chris-bot`)
+```bash
+sudo mkdir -p /opt/bots && sudo chown ubuntu:ubuntu /opt/bots
+cd /opt/bots
+git clone https://github.com/tntman715/Chris-bot.git
+cd /opt/bots/Chris-bot
+
+sudo apt-get update && sudo apt-get install -y python3-venv
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+cp .env.example .env
+chmod 600 .env
+# 이후 주인이 직접 nano /opt/bots/Chris-bot/.env 로 DISCORD_TOKEN 입력
+```
+
+### systemd 서비스 (`/etc/systemd/system/bot-chris.service`)
+```ini
+[Unit]
+Description=Chris-bot discord bot
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/bots/Chris-bot
+EnvironmentFile=/opt/bots/Chris-bot/.env
+ExecStart=/opt/bots/Chris-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+MemoryMax=150M
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now bot-chris
+journalctl -u bot-chris -n 50 --no-pager
+free -m
+```
+
+### 코드 수정 후 배포(업데이트) 시
+1. 로컬 PC에서 수정 후 `git commit` & `git push`
+2. 주인에게 동의를 구한 뒤 `bot2` 서버에서 반영:
+```bash
+ssh -i ~/.ssh/gfx_oracle -o BatchMode=yes ubuntu@161.33.0.94 "cd /opt/bots/Chris-bot && git pull && sudo systemctl restart bot-chris"
+```
+
+---
+
+## 4. 현재 구현된 기능 목록
+
+1. **포스트 작성자 직접 삭제 기능 (`bot.py`)**
+   - `/포스트삭제`: 허용된 채널의 포스트(스레드) 안에서 작성자(`owner_id`)가 실행하면 본인에게만 보이는 `[삭제 확인]` / `[취소]` 버튼을 띄우고, 확인 시 포스트 전체 삭제 (`channel.delete()`).
+   - `/포스트삭제채널 추가`, `/포스트삭제채널 제거`, `/포스트삭제채널 목록`: 서버 관리자(`manage_channels` 권한)가 포스트 직접 삭제를 허용할 상위 채널(포럼/텍스트 채널)을 설정 (`data/config.json`에 저장).
