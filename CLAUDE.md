@@ -38,50 +38,8 @@ ssh -i ~/.ssh/gfx_oracle -o BatchMode=yes ubuntu@161.33.0.94
 
 ## 3. `Chris-bot` 서버 설치 및 업데이트 표준 절차
 
-### 최초 설치 시 (`/opt/bots/Chris-bot`)
-```bash
-sudo mkdir -p /opt/bots && sudo chown ubuntu:ubuntu /opt/bots
-cd /opt/bots
-git clone https://github.com/tntman715/Chris-bot.git
-cd /opt/bots/Chris-bot
-
-sudo apt-get update && sudo apt-get install -y python3-venv
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-cp .env.example .env
-chmod 600 .env
-# 이후 주인이 직접 nano /opt/bots/Chris-bot/.env 로 DISCORD_TOKEN 입력
-```
-
-### systemd 서비스 (`/etc/systemd/system/bot-chris.service`)
-```ini
-[Unit]
-Description=Chris-bot discord bot
-After=network-online.target
-
-[Service]
-User=ubuntu
-WorkingDirectory=/opt/bots/Chris-bot
-EnvironmentFile=/opt/bots/Chris-bot/.env
-ExecStart=/opt/bots/Chris-bot/.venv/bin/python bot.py
-Restart=always
-RestartSec=10
-MemoryMax=150M
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now bot-chris
-journalctl -u bot-chris -n 50 --no-pager
-free -m
-```
-
 ### 코드 수정 후 배포(업데이트) 시
-1. 로컬 PC에서 수정 후 `git commit` & `git push`
+1. 로컬 PC(`c:\Users\tntma\Desktop\antigravity\Chris-bot`)에서 수정 후 `git commit` & `git push`
 2. 주인에게 동의를 구한 뒤 `bot2` 서버에서 반영:
 ```bash
 ssh -i ~/.ssh/gfx_oracle -o BatchMode=yes ubuntu@161.33.0.94 "cd /opt/bots/Chris-bot && git pull && sudo systemctl restart bot-chris"
@@ -89,8 +47,15 @@ ssh -i ~/.ssh/gfx_oracle -o BatchMode=yes ubuntu@161.33.0.94 "cd /opt/bots/Chris
 
 ---
 
-## 4. 현재 구현된 기능 목록
+## 4. 현재 구현된 기능 목록 (`bot.py`)
 
-1. **포스트 작성자 직접 삭제 기능 (`bot.py`)**
+1. **포스트 작성자 직접 삭제 기능**
    - `/포스트삭제`: 허용된 채널의 포스트(스레드) 안에서 작성자(`owner_id`)가 실행하면 본인에게만 보이는 `[삭제 확인]` / `[취소]` 버튼을 띄우고, 확인 시 포스트 전체 삭제 (`channel.delete()`).
    - `/포스트삭제채널 추가`, `/포스트삭제채널 제거`, `/포스트삭제채널 목록`: 서버 관리자(`manage_channels` 권한)가 포스트 직접 삭제를 허용할 상위 채널(포럼/텍스트 채널)을 설정 (`data/config.json`에 저장).
+
+2. **등급 취합 시스템**
+   - `/등급평가 [대상] [등급]`: 활성화된 시즌 채널에서 심사위원 역할 보유자(또는 관리자)가 대상 유저의 등급을 평가 (동일인 재평가 시 수정).
+   - `/등급관리 등급등록`, `/등급관리 등급삭제`, `/등급관리 심사역할지정`, `/등급관리 설정목록`: 등급 기호 · 점수 · 디스코드 역할 매핑 및 심사위원 역할 관리.
+   - `/등급관리 시즌시작`, `/등급관리 시즌종료`: 특정 채널에서 평가 시즌 시작 및 마감.
+   - `/등급관리 취합현황`, `/등급관리 평가삭제`, `/등급관리 등급수정`: 산술평균(사사오입 반올림) 취합 결과 조회, 특정 심사위원 평가 삭제, 관리자 수동 등급 지정.
+   - `/등급관리 최종승인`: 최종 승인 확인 버튼을 거쳐 대상 유저들의 디스코드 등급 역할을 자동 변경하고, 기존 등급 유무에 따라 `@유저 [기존] -> [신규]` 또는 `@유저 +[신규]` 형식의 공지 문구를 출력.
