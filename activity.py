@@ -29,7 +29,6 @@ logger = logging.getLogger("Chris-bot.activity")
 DB_FILE = Path(__file__).parent / "data" / "chris.db"
 ARCANE_IMPORT_FILE = Path(__file__).parent / "data" / "arcane_import.json"
 GRADE_CONFIG_FILE = Path(__file__).parent / "data" / "config.json"  # bot.py 등급 시스템 설정 (읽기 전용)
-MAX_BADGES = 10
 KST = timezone(timedelta(hours=9))
 
 # ---------------------------------------------------------------------
@@ -768,7 +767,7 @@ def register(tree: app_commands.CommandTree) -> None:
             database.save_settings(interaction.guild_id, s)
             text = (
                 f"✅ {역할.mention} 역할을 뱃지로 등록했습니다. 이 역할을 가진 사람의 `/랭크` 카드에 표시됩니다.\n"
-                f"*(카드에는 등급 다음에 등록한 순서대로 보이며, 자리가 모자라면 `+N`으로 표시됩니다.)*"
+                f"*(카드에는 등급 다음에 등록한 순서대로 보이며, 뱃지가 많으면 카드가 아래로 길어져 모두 표시됩니다.)*"
             )
         await interaction.response.send_message(text, ephemeral=True)
 

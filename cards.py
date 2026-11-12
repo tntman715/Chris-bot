@@ -174,8 +174,37 @@ def to_png(img: Image.Image) -> bytes:
 # ---------------------------------------------------------------------
 # 레벨 카드
 # ---------------------------------------------------------------------
+BADGE_H, BADGE_GAP_X, BADGE_GAP_Y = 36, 10, 10
+
+
+def badge_width(draw, badge: Badge, prefix: str = "") -> int:
+    return 14 + (BADGE_H - 10) + 8 + int(draw.textlength(clean(prefix + badge.name), font=font(20))) + 14
+
+
+def layout_badges(items, left: int, max_x: int) -> list[list[tuple[Badge, str, int]]]:
+    """뱃지를 줄 단위로 나눕니다. 한 줄에 안 들어가면 다음 줄로 넘깁니다 (줄 수 제한 없음)."""
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    rows: list[list[tuple[Badge, str, int]]] = [[]]
+    x = left
+    for badge, prefix in items:
+        w = min(badge_width(measure, badge, prefix), max_x - left)
+        if rows[-1] and x + w > max_x:
+            rows.append([])
+            x = left
+        rows[-1].append((badge, prefix, w))
+        x += w + BADGE_GAP_X
+    return rows if rows[0] else []
+
+
 def render_rank_card(d: RankCardData) -> bytes:
-    W, H = 920, 300
+    W = 920
+    ax, av_size = 44, 196
+    left = ax + av_size + 40
+    items = ([(d.grade, "등급 ")] if d.grade else []) + [(b, "") for b in d.badges]
+    badge_rows = layout_badges(items, left, W - 44)
+    # 뱃지가 두 줄 이상이면 그만큼 카드를 아래로 늘립니다.
+    extra = max(0, len(badge_rows) - 1) * (BADGE_H + BADGE_GAP_Y)
+    H = 300 + extra
     img = Image.new("RGBA", (W, H), BG)
     draw = ImageDraw.Draw(img)
 
@@ -186,14 +215,12 @@ def render_rank_card(d: RankCardData) -> bytes:
     ImageDraw.Draw(overlay).polygon([(W - 120, 0), (W, 0), (W, H)], fill=accent + (120,))
     img.alpha_composite(overlay)
 
-    # 아바타 (테두리 원)
-    av_size = 196
-    ax, ay = 44, (H - av_size) // 2
+    # 아바타 (테두리 원) — 카드가 길어져도 위쪽 자리에 고정
+    ay = (300 - av_size) // 2
     draw.ellipse((ax - 6, ay - 6, ax + av_size + 6, ay + av_size + 6), fill=accent)
     avatar = circle(load_image(d.avatar, av_size))
     img.paste(avatar, (ax, ay), avatar)
 
-    left = ax + av_size + 40
     right = W - 150
     width = right - left
 
@@ -217,25 +244,21 @@ def render_rank_card(d: RankCardData) -> bytes:
         draw.text((x, y - 6), value, font=font(30), fill=color)
         x += int(draw.textlength(value, font=font(30))) + 26
 
-    # 등급 · 뱃지
+    # 등급 · 뱃지 (여러 줄)
     y = 186
-    x = left
-    shown = 0
-    items = ([(d.grade, "등급 ")] if d.grade else []) + [(b, "") for b in d.badges]
-    for i, (badge, prefix) in enumerate(items):
-        f = font(20)
-        need = 14 + 26 + 8 + int(draw.textlength(clean(prefix + badge.name), font=f)) + 14
-        remaining = len(items) - i
-        if x + need > right + 120 or (remaining > 1 and x + need + 70 > right + 120):
-            if remaining > 0:
-                draw.text((x, y + 18), f"+{remaining}", font=font(22), fill=GRAY, anchor="lm")
-            break
-        x += draw_badge(img, draw, x, y, badge, prefix=prefix) + 10
-        shown += 1
+    for row in badge_rows:
+        x = left
+        for badge, prefix, w in row:
+            label_badge = badge
+            if badge_width(draw, badge, prefix) > w:  # 한 줄보다 긴 이름은 줄임표 처리
+                label_badge = Badge(fit(draw, clean(badge.name), font(20), w - 62 - int(draw.textlength(prefix, font=font(20)))), badge.color, badge.icon)
+            draw_badge(img, draw, x, y, label_badge, height=BADGE_H, prefix=prefix)
+            x += w + BADGE_GAP_X
+        y += BADGE_H + BADGE_GAP_Y
 
     # 경험치 막대
     ratio = d.xp_in_level / d.xp_needed if d.xp_needed else 0
-    progress_bar(draw, (left, 244, W - 44, 272), ratio, accent)
+    progress_bar(draw, (left, 244 + extra, W - 44, 272 + extra), ratio, accent)
 
     return to_png(img)
 
