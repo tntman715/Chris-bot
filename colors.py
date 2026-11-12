@@ -227,17 +227,52 @@ async def _get_or_create_role(guild: discord.Guild, color1: int, color2: Optiona
             kwargs["secondary_colour"] = discord.Colour(color2)
         role = await guild.create_role(**kwargs)
         add_color_role(guild.id, role.id, color1, color2)
-    # 크리스봇 역할 바로 아래로 (다른 색 역할보다 위에 있어야 이 색이 보임)
-    target = guild.me.top_role.position - 1
-    if target > 0 and role.position != target:
-        try:
-            await role.edit(position=target, reason="닉네임색: 위치 정리")
-        except discord.HTTPException:
-            logger.warning("색 역할 위치 변경 실패: %s", role.id)
     return role
 
 
-async def apply_color(member: discord.Member, color1: int, color2: Optional[int]) -> discord.Role:
+def color_role_ids(guild_id: int) -> set[int]:
+    return {r[0] for r in _conn().execute("SELECT role_id FROM color_roles WHERE guild_id = ?", (guild_id,))}
+
+
+def plan_positions(roles: list[tuple[int, int]], color_ids: set[int], bot_role_ids: set[int]) -> Optional[dict[int, int]]:
+    """색 역할들을 크리스봇의 가장 높은 역할 바로 아래로 모으는 새 위치 {역할 ID: 위치} (바뀌는 것만).
+    roles = [(역할 ID, 지금 위치)] (@everyone 제외). 옮길 수 없으면 None.
+    디스코드는 위치가 같으면 ID가 큰(새) 역할을 아래로 봅니다."""
+    order = sorted(roles, key=lambda r: (r[1], -r[0]))  # 아래 → 위
+    tops = [i for i, (rid, _) in enumerate(order) if rid in bot_role_ids]
+    if not tops:
+        return None
+    top = tops[-1]
+    bot_position = order[top][1]
+    below = [rid for rid, _ in order[:top]]
+    new = [rid for rid in below if rid not in color_ids] + [rid for rid in below if rid in color_ids]
+    if len(new) >= bot_position:  # 위치 번호가 겹쳐 있어 크리스봇 역할 아래에 다 못 넣음
+        return None
+    now = dict(roles)
+    return {rid: i + 1 for i, rid in enumerate(new) if now[rid] != i + 1}
+
+
+async def arrange_roles(guild: discord.Guild) -> dict[int, int]:
+    """색 역할들을 크리스봇 역할 바로 아래로 옮깁니다 (다른 색 역할보다 위에 있어야 그 색이 보임).
+    디스코드에서 최신 역할 순서를 받아 계산하며, 정리된 뒤의 {역할 ID: 위치}를 돌려줍니다."""
+    roles = await guild.fetch_roles()
+    pairs = [(r.id, r.position) for r in roles if not r.is_default()]
+    bot_ids = {r.id for r in guild.me.roles if not r.is_default()}
+    plan = plan_positions(pairs, color_role_ids(guild.id), bot_ids)
+    final = dict(pairs)
+    if plan is None:
+        logger.warning("닉네임색: 크리스봇 역할 아래로 색 역할을 옮길 수 없음 (guild %s)", guild.id)
+        return final
+    if plan:
+        by_id = {r.id: r for r in roles}
+        await guild.edit_role_positions(positions={by_id[rid]: pos for rid, pos in plan.items()},
+                                        reason="닉네임색: 색 역할을 크리스봇 역할 바로 아래로")
+        final.update(plan)
+    return final
+
+
+async def apply_color(member: discord.Member, color1: int, color2: Optional[int]) -> tuple[discord.Role, list[str]]:
+    """색 역할을 주고 (역할, 그보다 위에 있어 색을 가리는 역할 이름들)을 돌려줍니다."""
     guild = member.guild
     async with _lock(guild.id):
         role = await _get_or_create_role(guild, color1, color2)
@@ -250,7 +285,15 @@ async def apply_color(member: discord.Member, color1: int, color2: Optional[int]
             if old is not None and old in member.roles:
                 await member.remove_roles(old, reason="닉네임색 변경")
             await _delete_if_unused(guild, old_id)
-        return role
+        hiding: list[str] = []
+        try:
+            final = await arrange_roles(guild)
+            mine = final.get(role.id, 0)
+            hiding = [r.name for r in member.roles
+                      if r.id != role.id and r.colour.value and final.get(r.id, 0) > mine]
+        except discord.HTTPException:
+            logger.exception("닉네임색: 역할 위치 정리 실패")
+        return role, hiding
 
 
 async def clear_color(guild: discord.Guild, user_id: int, member: Optional[discord.Member], reason: str) -> bool:
@@ -293,6 +336,13 @@ async def boost_watch(client: discord.Client) -> None:
                 if guild is not None:
                     async with _lock(guild_id):
                         await _delete_if_unused(guild, role_id)
+            # 누가 역할 순서를 바꿔 색 역할이 내려갔으면 다시 크리스봇 역할 바로 아래로
+            guild_ids = {r[0] for r in _conn().execute("SELECT DISTINCT guild_id FROM color_roles")}
+            for guild_id in guild_ids:
+                guild = client.get_guild(guild_id)
+                if guild is not None:
+                    async with _lock(guild_id):
+                        await arrange_roles(guild)
         except Exception:
             logger.exception("닉네임색 부스트 확인 중 오류")
         await asyncio.sleep(BOOST_CHECK_MINUTES * 60)
@@ -360,7 +410,7 @@ def register(tree: app_commands.CommandTree) -> None:
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            role = await apply_color(member, color1, color2)
+            role, hiding = await apply_color(member, color1, color2)
         except discord.Forbidden:
             await interaction.followup.send("❌ 역할을 만들거나 줄 권한이 없습니다. 관리자에게 알려 주세요.", ephemeral=True)
             return
@@ -370,9 +420,8 @@ def register(tree: app_commands.CommandTree) -> None:
             return
         text = f"✅ 닉네임 색을 **{role_name(color1, color2)[len(ROLE_PREFIX):]}**(으)로 바꿨습니다!"
         # 더 위에 있는 다른 색 역할이 있으면 그 색이 먼저 보임
-        above = [r for r in member.roles if r.position > role.position and r.colour.value and r.id != role.id]
-        if above:
-            text += f"\n⚠️ 더 위에 있는 `{above[0].name}` 역할 색이 먼저 보일 수 있습니다. 관리자에게 알려 주세요."
+        if hiding:
+            text += f"\n⚠️ 더 위에 있는 `{hiding[0]}` 역할 색이 먼저 보일 수 있습니다. 관리자에게 알려 주세요."
         text += "\n색을 없애려면 `/닉네임색 해제`."
         await interaction.followup.send(text, file=_preview(member, color1, color2), ephemeral=True)
         logger.info("닉네임색 설정: %s → %s", member.id, role.name)

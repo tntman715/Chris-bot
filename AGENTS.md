@@ -116,7 +116,7 @@ ssh -i ~/.ssh/gfx_oracle -o BatchMode=yes ubuntu@161.33.0.94 "cd /opt/bots/Chris
 7. **부스터 닉네임 색 (`colors.py`, 주인 요청 2026-11-13)**
    - `/닉네임색 설정 [색] [그라데이션색]`: **서버 부스터만** (`member.premium_since` 또는 Server Booster 역할). 두 번째 색을 넣으면 그라데이션(역할 `secondary_colour`). 서버에 `ENHANCED_ROLE_COLORS` 기능이 없으면 두 번째 색은 거절 (2026-11-13 메인 서버는 부스트 8개 · 기능 열려 있음).
    - 색 입력: 자동완성 색 이름 22개(`PRESETS`) 또는 헥스(`#FF8800` · `FF8800` · `#F80`), 순수 함수 `parse_color()`. 검정 0은 디스코드에서 '색 없음'이라 `0x010101`로.
-   - 역할: 색(1색/2색 조합)마다 하나 `🎨 #RRGGBB [→ #RRGGBB]`, 같은 색끼리 공유. 테이블 `color_roles(role_id, guild_id, color1, color2)` · `member_colors(guild_id, user_id, role_id)`. 아무도 안 쓰면 역할 삭제, 관리자가 손으로 지운 역할은 다시 만듦. 위치는 `Chris Bot` 역할 바로 아래 (2026-11-13: `Chris Bot`이 66번째로 등급 · Server Booster 역할보다 위, 그 위에는 Owner · Admin · People color · RaidProtect · carl-bot).
+   - 역할: 색(1색/2색 조합)마다 하나 `🎨 #RRGGBB [→ #RRGGBB]`, 같은 색끼리 공유. 테이블 `color_roles(role_id, guild_id, color1, color2)` · `member_colors(guild_id, user_id, role_id)`. 아무도 안 쓰면 역할 삭제, 관리자가 손으로 지운 역할은 다시 만듦. 위치는 `Chris Bot` 역할 바로 아래 — `arrange_roles()`가 매번 `fetch_roles()`로 최신 순서를 받아 순수 함수 `plan_positions()`로 계산해 `edit_role_positions`로 한꺼번에 옮김 (`role.edit(position=)`은 캐시가 낡아 맨 아래에 남는 문제가 있었음), `boost_watch`도 30분마다 재정리 (2026-11-13: `Chris Bot`이 66번째로 등급 · Server Booster 역할보다 위, 그 위에는 Owner · Admin · People color · RaidProtect · carl-bot).
    - `boost_watch()`: 30분마다 `member_colors`의 사람을 `fetch_member`로 확인해 부스트가 끝났거나 나간 사람의 색 역할 회수 (Server Members Intent 없이 동작).
    - `/닉네임색 해제`, `/닉네임색 미리보기` (누구나, `cards.render_name_color` — 어두운 · 밝은 화면 미리보기 이미지).
 
