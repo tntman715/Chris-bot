@@ -621,6 +621,11 @@ async def import_stars(guild: discord.Guild, board: discord.TextChannel, progres
         try:
             async for m in channel.history(limit=None):
                 scanned_messages += 1
+                if scanned_messages % 2000 == 0:  # 큰 채널은 오래 걸리므로 중간 진행 상황도 표시
+                    await progress(
+                        f"채널 {i}/{len(sources)} 훑는 중 (메시지 {scanned_messages:,}개, "
+                        f"{m.created_at:%Y-%m-%d}까지, 별 받은 메시지 {len(rows):,}개)"
+                    )
                 reaction = next((r for r in m.reactions if str(r.emoji) == STAR), None)
                 if reaction is None or m.author.bot:
                     continue
