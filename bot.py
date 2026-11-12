@@ -734,6 +734,12 @@ class ChrisBot(discord.Client):
         except Exception:
             logger.exception("활동량 기록 중 오류")
 
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        try:
+            await activity.handle_reaction(payload, self)
+        except Exception:
+            logger.exception("반응 경험치 기록 중 오류")
+
 
 bot = ChrisBot()
 activity.register(bot.tree)

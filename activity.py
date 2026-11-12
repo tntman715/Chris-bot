@@ -4,9 +4,11 @@
 - 채팅을 감지해 경험치(레벨)와 재화(코인)를 적립합니다.
 - 글 내용은 저장하지 않습니다. 길이(글자 수)와 사진·영상 첨부 여부만 사용하고 바로 버립니다.
 - 데이터는 data/chris.db (SQLite)에 유저 ID 기준으로 저장하므로, 서버를 나갔다 들어와도 유지됩니다.
-- 레벨 공식은 Arcane/MEE6과 같은 공식을 사용합니다 (나중에 Arcane 데이터를 그대로 옮기기 위함).
+- 레벨 공식 · 경험치 지급량은 이 서버의 기존 Arcane 설정과 똑같이 맞췄습니다 (Arcane 순위표 100명으로 검증).
+  Arcane "Linear, Multiplier 1" = 레벨 L → L+1 에 필요한 경험치 100L + 75
 """
 
+import asyncio
 import json
 import logging
 import random
@@ -22,13 +24,17 @@ from discord import app_commands
 logger = logging.getLogger("Chris-bot.activity")
 
 DB_FILE = Path(__file__).parent / "data" / "chris.db"
+ARCANE_IMPORT_FILE = Path(__file__).parent / "data" / "arcane_import.json"
 KST = timezone(timedelta(hours=9))
 
 # ---------------------------------------------------------------------
-# 조정 가능한 숫자들
+# 조정 가능한 숫자들 (경험치 관련 값은 기존 Arcane 설정과 동일)
 # ---------------------------------------------------------------------
 XP_COOLDOWN_SECONDS = 60  # 같은 사람은 이 시간(초)에 한 번만 경험치/코인 지급 (도배 방지)
-XP_MIN, XP_MAX = 15, 25  # 1회 지급 경험치 (Arcane/MEE6 기본값과 동일)
+XP_MIN, XP_MAX = 15, 40  # 채팅 1회 지급 경험치
+REACTION_XP = 25  # 반응(이모지)을 단 사람에게 주는 경험치
+REACTION_COOLDOWN_SECONDS = 300  # 반응 경험치는 5분에 한 번
+LEVEL_BASE, LEVEL_STEP = 75, 100  # 레벨 L → L+1 필요 경험치 = LEVEL_STEP × L + LEVEL_BASE
 COIN_BASE = 1  # 1회 지급 기본 코인
 COIN_LENGTH_BONUS = ((150, 2), (50, 1))  # (최소 글자 수, 보너스) — 긴 글 보너스 (큰 값부터)
 COIN_MEDIA_BONUS = 2  # 사진·영상 첨부 보너스
@@ -49,15 +55,15 @@ DEFAULT_SETTINGS = {
 
 
 # =====================================================================
-# 레벨 공식 (Arcane/MEE6 호환: 레벨 L -> L+1 에 필요한 경험치 = 5L² + 50L + 100)
+# 레벨 공식 (Arcane Linear: 레벨 L -> L+1 에 필요한 경험치 = 100L + 75)
 # =====================================================================
 def xp_to_next(level: int) -> int:
-    return 5 * level * level + 50 * level + 100
+    return LEVEL_STEP * level + LEVEL_BASE
 
 
 def total_xp_for_level(level: int) -> int:
-    """레벨 level 이 시작되는 누적 경험치"""
-    return sum(xp_to_next(i) for i in range(level))
+    """레벨 level 이 시작되는 누적 경험치 (= 50L² + 25L)"""
+    return LEVEL_STEP * level * (level - 1) // 2 + LEVEL_BASE * level
 
 
 def level_from_xp(xp: int) -> int:
@@ -237,6 +243,22 @@ class ActivityDB:
         self.conn.commit()
         return old
 
+    def add_xp(self, guild_id: int, user_id: int, amount: int) -> tuple[int, int]:
+        """경험치만 더하고 (이전 경험치, 새 경험치)를 반환합니다. (반응 경험치, Arcane 가져오기용)"""
+        old = self.get_member(guild_id, user_id)["xp"]
+        self.conn.execute(
+            "INSERT INTO members (guild_id, user_id, xp) VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET xp = xp + excluded.xp",
+            (guild_id, user_id, amount),
+        )
+        self.conn.execute(
+            "INSERT INTO daily (guild_id, user_id, day, xp) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id, day) DO UPDATE SET xp = xp + excluded.xp",
+            (guild_id, user_id, today_kst(), amount),
+        )
+        self.conn.commit()
+        return old, old + amount
+
     def add_coins(self, guild_id: int, user_id: int, amount: int) -> int:
         """코인을 더하거나 빼고(0 미만으로는 내려가지 않음) 새 잔액을 반환합니다."""
         current = self.get_member(guild_id, user_id)["coins"]
@@ -313,7 +335,32 @@ async def handle_message(message: discord.Message) -> None:
     if awarded and settings.get("live"):
         old_level, new_level = level_from_xp(old_xp), level_from_xp(new_xp)
         if new_level > old_level:
-            await _on_level_up(message, message.author, new_level, settings)
+            await _on_level_up(message.channel, message.author, new_level, settings)
+
+
+_last_reaction_award: dict[tuple[int, int], float] = {}
+
+
+async def handle_reaction(payload: discord.RawReactionActionEvent, client: discord.Client) -> None:
+    """반응(이모지)을 단 사람에게 5분에 한 번 경험치를 줍니다 (Arcane 'Reactor' 설정과 동일, 코인은 없음)."""
+    member = payload.member
+    if payload.guild_id is None or member is None or member.bot:
+        return
+    database = get_db()
+    settings = database.get_settings(payload.guild_id)
+    channel = client.get_channel(payload.channel_id)
+    if channel is not None and _is_excluded(channel, settings):
+        return
+
+    key = (payload.guild_id, member.id)
+    now = time.monotonic()
+    if now - _last_reaction_award.get(key, -1e9) < REACTION_COOLDOWN_SECONDS:
+        return
+    _last_reaction_award[key] = now
+
+    old_xp, new_xp = database.add_xp(payload.guild_id, member.id, REACTION_XP)
+    if settings.get("live") and level_from_xp(new_xp) > level_from_xp(old_xp) and channel is not None:
+        await _on_level_up(channel, member, level_from_xp(new_xp), settings)
 
 
 async def sync_level_roles(member: discord.Member, level: int, settings: dict) -> Optional[discord.Role]:
@@ -340,10 +387,11 @@ async def sync_level_roles(member: discord.Member, level: int, settings: dict) -
 
 
 async def _on_level_up(
-    message: discord.Message, member: discord.Member, new_level: int, settings: dict
+    source_channel, member: discord.Member, new_level: int, settings: dict
 ) -> None:
     new_role = await sync_level_roles(member, new_level, settings)
-    text = f"🎉 {member.mention}님이 **레벨 {new_level}**이 되었습니다!"
+    # 기존 Arcane 알림 문구와 같은 형식 (멘션 알림은 울리지 않음)
+    text = f"{member.mention} 이(가) **{new_level}** 레벨을 달성했습니다"
     if new_role:
         text += f" ({new_role.mention} 역할 획득)"
 
@@ -351,11 +399,45 @@ async def _on_level_up(
     if settings.get("announce_channel_id"):
         channel = member.guild.get_channel(int(settings["announce_channel_id"]))
     if channel is None:
-        channel = message.channel
+        channel = source_channel
     try:
-        await channel.send(text, allowed_mentions=discord.AllowedMentions(users=[member], roles=False))
+        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException as e:
         logger.warning(f"레벨업 알림 전송 실패: {e}")
+
+
+def _normalize_name(name: str) -> str:
+    return name.lower().replace("_", "").replace(".", "")
+
+
+async def _find_member_by_username(guild: discord.Guild, username: str) -> Optional[discord.Member]:
+    """Arcane 순위표의 아이디로 서버 멤버를 찾습니다. (정확히 일치 → 밑줄·점 무시 비교 순)"""
+    try:
+        found = await guild.query_members(query=username, limit=10, cache=False)
+        for m in found:
+            if m.name.lower() == username.lower():
+                return m
+        key = _normalize_name(username)
+        prefix = username.strip("_.")[:3] or username[:3]
+        found = await guild.query_members(query=prefix, limit=100, cache=False)
+        for m in found:
+            if _normalize_name(m.name) == key:
+                return m
+    except (asyncio.TimeoutError, discord.HTTPException) as e:
+        logger.warning(f"멤버 검색 실패 ({username}): {e}")
+    return None
+
+
+def _split_lines(text: str, limit: int = 1900) -> list[str]:
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = ""
+        current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 # =====================================================================
@@ -529,10 +611,64 @@ def register(tree: app_commands.CommandTree) -> None:
             f"- **레벨업 알림 채널**: {announce}\n"
             f"- **활동량 제외 채널**: {excluded}\n"
             f"- **레벨 역할**:\n{role_text}\n"
-            f"- **지급 규칙**: {XP_COOLDOWN_SECONDS}초에 한 번, 경험치 {XP_MIN}~{XP_MAX} / "
-            f"{CURRENCY_NAME} {COIN_BASE}개 (긴 글: {bonus}, 사진·영상 +{COIN_MEDIA_BONUS})"
+            f"- **지급 규칙**: 채팅은 {XP_COOLDOWN_SECONDS}초에 한 번 경험치 {XP_MIN}~{XP_MAX} + "
+            f"{CURRENCY_NAME} {COIN_BASE}개 (긴 글: {bonus}, 사진·영상 +{COIN_MEDIA_BONUS}) / "
+            f"반응은 {REACTION_COOLDOWN_SECONDS // 60}분에 한 번 경험치 {REACTION_XP}\n"
+            f"- **Arcane 기록 가져오기**: {'완료 (' + str(len(s.get('arcane_imported', []))) + '명)' if s.get('arcane_imported') else '아직 안 함'}"
         )
         await interaction.response.send_message(msg, ephemeral=True)
+
+    @admin.command(
+        name="아케인가져오기",
+        description="Arcane 순위표 1~100위 기록(경험치)을 크리스봇 경험치에 더합니다. (한 번만 실행)",
+    )
+    async def import_arcane(interaction: discord.Interaction):
+        guild = interaction.guild
+        database = get_db()
+        settings = database.get_settings(guild.id)
+        if settings.get("arcane_imported"):
+            await interaction.response.send_message(
+                f"ℹ️ 이미 Arcane 기록을 가져왔습니다 ({len(settings['arcane_imported'])}명). 두 번 더해지지 않도록 막았습니다.",
+                ephemeral=True,
+            )
+            return
+        if not ARCANE_IMPORT_FILE.exists():
+            await interaction.response.send_message(
+                "❌ 서버에 `data/arcane_import.json` 파일이 없습니다.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        entries = json.loads(ARCANE_IMPORT_FILE.read_text(encoding="utf-8"))
+        imported: list[int] = []
+        lines: list[str] = []
+        missing: list[str] = []
+        for e in entries:
+            member = await _find_member_by_username(guild, e["username"])
+            if member is None:
+                missing.append(f"{e['rank']}위 `{e['username']}` (레벨 {e['level']})")
+            else:
+                old_xp, new_xp = database.add_xp(guild.id, member.id, int(e["xp"]))
+                imported.append(member.id)
+                lines.append(
+                    f"{e['rank']}. {member.mention} 레벨 {level_from_xp(old_xp)} → **{level_from_xp(new_xp)}**"
+                )
+            await asyncio.sleep(0.7)  # 디스코드 요청 속도 제한 보호
+
+        settings["arcane_imported"] = imported
+        database.save_settings(guild.id, settings)
+
+        report = (
+            f"### 📥 Arcane 기록 가져오기 완료: {len(imported)}명\n" + "\n".join(lines)
+        )
+        if missing:
+            report += (
+                f"\n\n⚠️ **서버에서 찾지 못한 {len(missing)}명** "
+                "(서버를 나갔거나 아이디가 바뀜 — 필요하면 `/레벨관리 레벨설정`으로 직접 지정):\n"
+                + "\n".join(missing)
+            )
+        for chunk in _split_lines(report):
+            await interaction.followup.send(chunk, ephemeral=True)
 
     @admin.command(name="레벨설정", description="유저의 레벨(경험치)을 직접 지정합니다. (Arcane 기록 보정 등)")
     @app_commands.describe(
