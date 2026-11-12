@@ -11,6 +11,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 import activity
+import bounty
 
 # .env 파일에서 환경변수 로드
 load_dotenv()
@@ -740,9 +741,16 @@ class ChrisBot(discord.Client):
         except Exception:
             logger.exception("반응 경험치 기록 중 오류")
 
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent):
+        try:
+            await bounty.handle_thread_delete(payload)
+        except Exception:
+            logger.exception("포스트 삭제 현상금 환불 중 오류")
+
 
 bot = ChrisBot()
 activity.register(bot.tree)
+bounty.register(bot.tree)
 
 
 # =====================================================================

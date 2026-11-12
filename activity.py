@@ -61,6 +61,7 @@ DEFAULT_SETTINGS = {
     "level_roles": {},  # "레벨" -> 역할 ID
     "badge_roles": [],  # /랭크 카드에 뱃지로 보여 줄 역할 ID (등록 순서대로 표시)
     "work_channels": [],  # 작업물 채널 — 사진·영상을 올리면 경험치 보너스 (스레드는 상위 채널 기준)
+    "request_channels": [],  # 작품신청 포럼 채널 (bounty.py 현상금 시스템)
 }
 
 
@@ -618,13 +619,20 @@ def register(tree: app_commands.CommandTree) -> None:
         today = database.messages_since(gid, target.id, today_kst())
         week = database.messages_since(gid, target.id, day_kst(6))
         month = database.messages_since(gid, target.id, day_kst(29))
+        try:  # 작품 처리 횟수 (bounty.py 테이블)
+            solved = database.conn.execute(
+                "SELECT COUNT(*) FROM bounty_requests WHERE guild_id = ? AND solver_id = ? AND status = 'done'",
+                (gid, target.id),
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            solved = 0
 
         msg = (
             f"### 📊 {target.mention}님의 활동량\n"
             f"- **레벨 {level}** (서버 {rank}위)\n"
             f"  `{_progress_bar(cur, need)}` {cur} / {need} XP (누적 {m['xp']} XP)\n"
             f"- **보유 {CURRENCY_NAME}**: {m['coins']} {CURRENCY_EMOJI}\n"
-            f"- **기여 점수**: {m['contribution']}\n"
+            f"- **기여 점수**: {m['contribution']} (작품 처리 {solved}회)\n"
             f"- **채팅 수**: 오늘 {today} · 최근 7일 {week} · 최근 30일 {month} · 전체 {m['messages']}"
         )
         await interaction.response.send_message(msg, ephemeral=True)
