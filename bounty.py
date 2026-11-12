@@ -48,6 +48,14 @@ def ensure_tables() -> None:
         CREATE INDEX IF NOT EXISTS idx_bounty_guild_status ON bounty_requests (guild_id, status);
         """
     )
+    # 기여 점수 기록이 생기기 전에 완료된 신청은 한 번만 옮겨 둠 (기간별 순위용)
+    if _conn().execute("SELECT COUNT(*) FROM contribution_log").fetchone()[0] == 0:
+        _conn().execute(
+            "INSERT INTO contribution_log (guild_id, user_id, points, at) "
+            "SELECT guild_id, solver_id, amount * ?, closed_at FROM bounty_requests "
+            "WHERE status = 'done' AND solver_id IS NOT NULL AND amount > 0",
+            (CONTRIBUTION_MULTIPLIER,),
+        )
     _conn().commit()
 
 
@@ -123,6 +131,11 @@ def complete_request(thread_id: int, guild_id: int, solver_id: int) -> Optional[
         "contribution = contribution + excluded.contribution",
         (guild_id, solver_id, amount, points),
     )
+    if points:
+        conn.execute(
+            "INSERT INTO contribution_log (guild_id, user_id, points, at) VALUES (?, ?, ?, ?)",
+            (guild_id, solver_id, points, _now()),
+        )
     conn.commit()
     return amount, points
 

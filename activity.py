@@ -100,6 +100,11 @@ def coins_for_message(length: int) -> int:
     return coins
 
 
+def utc_days_ago(days: int) -> str:
+    """기여 점수 기록(contribution_log.at)과 비교할 UTC 시각 문자열"""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def today_kst() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d")
 
@@ -140,6 +145,14 @@ class ActivityDB:
                 PRIMARY KEY (guild_id, user_id, day)
             );
             CREATE INDEX IF NOT EXISTS idx_daily_guild_day ON daily (guild_id, day);
+            -- 기여 점수 기록 (언제 몇 점 받았는지) — 최근 30일 · 90일 기여 점수 순위용
+            CREATE TABLE IF NOT EXISTS contribution_log (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                points INTEGER NOT NULL,
+                at TEXT NOT NULL  -- UTC "YYYY-MM-DD HH:MM:SS"
+            );
+            CREATE INDEX IF NOT EXISTS idx_contrib_guild_at ON contribution_log (guild_id, at);
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 data TEXT NOT NULL
@@ -252,6 +265,20 @@ class ActivityDB:
             "GROUP BY user_id ORDER BY m DESC LIMIT ?",
             (guild_id, since_day, limit),
         ).fetchall()
+
+    def top_contribution_since(self, guild_id: int, since_utc: str, limit: int = 10) -> list[tuple[int, int]]:
+        """since_utc 이후에 받은 기여 점수 순위 [(유저 ID, 점수)]"""
+        return self.conn.execute(
+            "SELECT user_id, SUM(points) AS p FROM contribution_log WHERE guild_id = ? AND at >= ? "
+            "GROUP BY user_id HAVING p > 0 ORDER BY p DESC, user_id LIMIT ?",
+            (guild_id, since_utc, limit),
+        ).fetchall()
+
+    def contribution_since(self, guild_id: int, user_id: int, since_utc: str) -> int:
+        return self.conn.execute(
+            "SELECT COALESCE(SUM(points), 0) FROM contribution_log WHERE guild_id = ? AND user_id = ? AND at >= ?",
+            (guild_id, user_id, since_utc),
+        ).fetchone()[0]
 
     def set_xp(self, guild_id: int, user_id: int, xp: int) -> int:
         """경험치를 지정한 값으로 바꾸고 이전 경험치를 반환합니다."""
@@ -649,6 +676,8 @@ def register(tree: app_commands.CommandTree) -> None:
             ).fetchone()[0]
         except sqlite3.OperationalError:
             solved = 0
+        c30 = database.contribution_since(gid, target.id, utc_days_ago(30))
+        c90 = database.contribution_since(gid, target.id, utc_days_ago(90))
         star_line = ""
         import stars  # 순환 import 방지 (stars 가 activity 를 import)
 
@@ -661,7 +690,7 @@ def register(tree: app_commands.CommandTree) -> None:
             f"- **레벨 {level}** (서버 {rank}위)\n"
             f"  `{_progress_bar(cur, need)}` {cur} / {need} XP (누적 {m['xp']} XP)\n"
             f"- **보유 {CURRENCY_NAME}**: {m['coins']} {CURRENCY_EMOJI}\n"
-            f"- **기여 점수**: {m['contribution']} (작품 처리 {solved}회)\n"
+            f"- **기여 점수**: 누적 {m['contribution']} · 최근 30일 {c30} · 최근 90일 {c90} (작품 처리 {solved}회)\n"
             f"- **채팅 수**: 오늘 {today} · 최근 7일 {week} · 최근 30일 {month} · 전체 {m['messages']}"
             + star_line
         )
@@ -674,7 +703,9 @@ def register(tree: app_commands.CommandTree) -> None:
         기준=[
             app_commands.Choice(name="레벨", value="xp"),
             app_commands.Choice(name=f"보유 {CURRENCY_NAME}", value="coins"),
-            app_commands.Choice(name="기여 점수", value="contribution"),
+            app_commands.Choice(name="기여 점수 (누적)", value="contribution"),
+            app_commands.Choice(name="기여 점수 (최근 30일)", value="contribution30"),
+            app_commands.Choice(name="기여 점수 (최근 90일)", value="contribution90"),
             app_commands.Choice(name="최근 7일 채팅 수", value="week"),
             app_commands.Choice(name="최근 30일 채팅 수", value="month"),
         ]
@@ -688,8 +719,12 @@ def register(tree: app_commands.CommandTree) -> None:
             rows, title, fmt = database.top_recent(gid, day_kst(29)), "최근 30일 채팅 수", lambda v: f"{v}개"
         elif 기준 == "coins":
             rows, title, fmt = database.top_members(gid, "coins"), f"보유 {CURRENCY_NAME}", lambda v: f"{v} {CURRENCY_EMOJI}"
+        elif 기준 in ("contribution30", "contribution90"):
+            days = 30 if 기준 == "contribution30" else 90
+            rows = database.top_contribution_since(gid, utc_days_ago(days))
+            title, fmt = f"최근 {days}일 기여 점수", lambda v: f"{v}점"
         elif 기준 == "contribution":
-            rows, title, fmt = database.top_members(gid, "contribution"), "기여 점수", lambda v: f"{v}점"
+            rows, title, fmt = database.top_members(gid, "contribution"), "누적 기여 점수", lambda v: f"{v}점"
         else:
             rows, title, fmt = database.top_members(gid, "xp"), "레벨", lambda v: f"레벨 {level_from_xp(v)} ({v} XP)"
 
