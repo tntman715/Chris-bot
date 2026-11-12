@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -57,6 +58,7 @@ def get_guild_data(config: dict, guild_id: int) -> dict:
         g["grade_system"] = {
             "grades": {},  # code -> {"code": str, "value": float, "role_id": int, "role_name": str}
             "evaluator_roles": {},  # role_id_str -> {"role_id": int, "max_grade": Optional[str], "allow_plus": bool}
+            "archive_channel_id": None,  # 투표 내역 아카이브 채널 ID
             "season": {
                 "active": False,
                 "channel_id": None,
@@ -64,7 +66,8 @@ def get_guild_data(config: dict, guild_id: int) -> dict:
             },
         }
     gs = g["grade_system"]
-    # 이전 버전(evaluator_role_ids 리스트) 호환 변환
+    if "archive_channel_id" not in gs:
+        gs["archive_channel_id"] = None
     if "evaluator_roles" not in gs:
         old_ids = gs.pop("evaluator_role_ids", [])
         gs["evaluator_roles"] = {
@@ -94,6 +97,52 @@ def format_score(val: float) -> str:
     return f"{val:.6f}".rstrip("0").rstrip(".")
 
 
+async def send_archive_log(
+    guild: Optional[discord.Guild], archive_channel_id: Optional[int], text: str
+) -> bool:
+    """
+    지정된 아카이브 채널에 투표/관리 내역을 기록합니다.
+    메시지가 길 경우 1,900자 단위로 나누어 전송합니다.
+    """
+    if guild is None or not archive_channel_id:
+        return False
+
+    channel = guild.get_channel(int(archive_channel_id))
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(int(archive_channel_id))
+        except discord.HTTPException:
+            return False
+
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return False
+
+    try:
+        lines = text.split("\n")
+        chunk = []
+        current_len = 0
+        for line in lines:
+            if current_len + len(line) + 1 > 1900 and chunk:
+                await channel.send(
+                    "\n".join(chunk),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                chunk = [line]
+                current_len = len(line) + 1
+            else:
+                chunk.append(line)
+                current_len += len(line) + 1
+        if chunk:
+            await channel.send(
+                "\n".join(chunk),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return True
+    except discord.HTTPException as e:
+        logger.warning(f"아카이브 채널 로그 전송 실패: {e}")
+        return False
+
+
 # =====================================================================
 # 등급 계산 및 점근적(+ / -) 점수 헬퍼 함수
 # =====================================================================
@@ -101,27 +150,6 @@ def parse_grade_expression(expr: str, grades: dict) -> Optional[dict]:
     """
     사용자가 입력한 등급 문자열(예: 'C', 'C+', 'C++', 'B-', 'B--')을 파싱하여
     점근적 점수를 계산해 반환합니다.
-
-    점근 공식 (간격 Δ 기준, 기본 Δ=1):
-      + 가 k개일 때: base + 0.5 * Δ * (1 - 1 / 2^k)
-        k=1 (+):  +0.25
-        k=2 (++): +0.375
-        k=3 (+++): +0.4375 ...
-      - 가 k개일 때: base - 0.5 * Δ * (1 - 1 / 2^k)
-        k=1 (-):  -0.25
-        k=2 (--): -0.375 (예: 3 - 0.375 = 2.625)
-        k=3 (---): -0.4375 ...
-
-    반환값:
-      {
-        "display_code": "C++",     # 정규화된 표시 기호
-        "base_code": "C",          # 기본 등급 기호
-        "base_value": 2.0,         # 기본 등급 점수
-        "value": 2.375,            # 최종 계산된 점수
-        "modifier": "++",          # 수식어 ('', '+', '--' 등)
-        "role_id": ...,            # 기본 등급의 역할 ID
-        "role_name": ...,          # 기본 등급의 역할 이름
-      }
     """
     cleaned = expr.strip()
     m = GRADE_INPUT_PATTERN.match(cleaned)
@@ -141,7 +169,6 @@ def parse_grade_expression(expr: str, grades: dict) -> Optional[dict]:
     base_info = grades[matched_code]
     base_val = float(base_info["value"])
 
-    # 인접 등급과의 간격 계산 (기본값 1.0)
     sorted_vals = sorted(set(float(g["value"]) for g in grades.values()))
     idx = sorted_vals.index(base_val)
 
@@ -154,7 +181,7 @@ def parse_grade_expression(expr: str, grades: dict) -> Optional[dict]:
             gap = 1.0
         offset = 0.5 * gap * (1.0 - (1.0 / (2**k)))
         final_val = base_val + offset
-    else:  # modifier.startswith("-")
+    else:
         k = len(modifier)
         gap = (base_val - sorted_vals[idx - 1]) if (idx - 1 >= 0) else 1.0
         if gap <= 0:
@@ -178,7 +205,6 @@ def get_member_voting_limit(
 ) -> tuple[bool, Optional[float], Optional[str]]:
     """
     멤버가 투표 가능한지 여부와 최대 허용 점수(제한 없으면 None), 최대 등급 안내 문자열을 반환합니다.
-    여러 심사위원 역할을 동시에 가지고 있으면 가장 높은 권한을 적용합니다.
     """
     if member.guild_permissions.manage_guild:
         return True, None, "제한 없음 (관리자)"
@@ -195,15 +221,12 @@ def get_member_voting_limit(
     if not matched_configs:
         return False, None, None
 
-    # 하나라도 무제한(max_grade is None) 역할이 있으면 무제한
     for r_conf in matched_configs:
         if not r_conf.get("max_grade"):
             return True, None, "모든 등급"
 
     max_allowed_score = -1e18
     best_label = None
-
-    # 정렬된 기본 등급 점수 목록 (다음 등급과의 경계 계산용)
     sorted_vals = sorted(set(float(g["value"]) for g in grades.values()))
 
     for r_conf in matched_configs:
@@ -211,11 +234,9 @@ def get_member_voting_limit(
         allow_plus = r_conf.get("allow_plus", True)
         parsed = parse_grade_expression(max_expr, grades) if max_expr else None
         if parsed is None:
-            # 등록된 등급이 삭제되었거나 찾을 수 없으면 무제한으로 폴백
             return True, None, "모든 등급"
 
         if not parsed["modifier"] and allow_plus:
-            # 예: 최대등급이 'B'이고 플러스 허용이면 B+, B++ 등 B 계열 전체 허용 (B와 다음 등급의 중간값 미만까지)
             base_val = parsed["base_value"]
             idx = sorted_vals.index(base_val)
             gap = (
@@ -226,7 +247,6 @@ def get_member_voting_limit(
             limit_score = base_val + 0.5 * gap - 1e-9
             label = f"{parsed['base_code']} 계열 ({parsed['base_code']}+ 포함)"
         else:
-            # 예: 플러스 비허용이거나 직접 'B+' 등 세부 등급으로 상한을 지정한 경우
             limit_score = parsed["value"]
             label = f"{parsed['display_code']} ({format_score(limit_score)}점)"
 
@@ -238,10 +258,7 @@ def get_member_voting_limit(
 
 
 def find_closest_grade(avg_value: float, grades: dict) -> Optional[dict]:
-    """
-    산술평균 점수(avg_value)에서 가장 가까운 기본 등급을 반환합니다.
-    거리가 같을 경우(예: 2점과 3점 사이 2.5점) 반올림(사사오입) 원칙에 따라 더 높은 점수의 등급을 선택합니다.
-    """
+    """산술평균 점수(avg_value)에서 가장 가까운 기본 등급을 반환합니다 (동률 시 상위 등급)."""
     if not grades:
         return None
     sorted_grades = sorted(
@@ -254,9 +271,7 @@ def find_closest_grade(avg_value: float, grades: dict) -> Optional[dict]:
 def calculate_target_result(
     target_data: dict, grades: dict
 ) -> tuple[Optional[float], Optional[dict], bool]:
-    """
-    대상 유저의 (산술평균 점수, 최종 결정된 등급 정보 dict, 관리자 수동수정 여부)를 반환합니다.
-    """
+    """대상 유저의 (산술평균 점수, 최종 결정된 등급 정보 dict, 관리자 수동수정 여부)를 반환합니다."""
     scores = target_data.get("scores", {})
     override_code = target_data.get("override_grade")
 
@@ -368,6 +383,7 @@ class ApproveSeasonView(discord.ui.View):
         grades = gs["grades"]
         season = gs["season"]
         evaluations = season.get("evaluations", {})
+        archive_channel_id = gs.get("archive_channel_id")
 
         if not evaluations:
             await interaction.edit_original_response(
@@ -383,11 +399,14 @@ class ApproveSeasonView(discord.ui.View):
 
         announcement_lines_mention = []
         announcement_lines_username = []
+        archive_detail_lines = []
         role_errors = []
         processed_count = 0
 
         for target_id_str, target_data in evaluations.items():
-            avg_val, final_grade, _ = calculate_target_result(target_data, grades)
+            avg_val, final_grade, is_overridden = calculate_target_result(
+                target_data, grades
+            )
             if final_grade is None:
                 continue
 
@@ -445,22 +464,76 @@ class ApproveSeasonView(discord.ui.View):
             if old_role_name:
                 line_mention = f"{user_mention} {old_role_name} -> {new_role_name}"
                 line_user = f"{user_tag} {old_role_name} -> {new_role_name}"
+                change_summary = f"`{old_role_name}` ➡️ `{new_role_name}`"
             else:
                 line_mention = f"{user_mention} +{new_role_name}"
                 line_user = f"{user_tag} +{new_role_name}"
+                change_summary = f"`+{new_role_name}` (신규)"
 
             announcement_lines_mention.append(line_mention)
             announcement_lines_username.append(line_user)
+
+            # 아카이브 기록용 상세 내역 생성
+            scores = target_data.get("scores", {})
+            avg_str = (
+                f"{avg_val:.3f}".rstrip("0").rstrip(".")
+                if avg_val is not None
+                else "평가 없음"
+            )
+            override_note = (
+                f" *(관리자 수동 지정: `{final_grade['code']}`)*"
+                if is_overridden
+                else ""
+            )
+            voter_details = []
+            for eid, s_info in scores.items():
+                v_str = format_score(float(s_info["value"]))
+                eval_name = s_info.get("evaluator_name", "")
+                name_tag = f"({eval_name})" if eval_name else ""
+                voter_details.append(
+                    f"<@{eid}>{name_tag}: **`{s_info['grade']}`**({v_str}점)"
+                )
+            voter_str = ", ".join(voter_details) if voter_details else "투표 없음"
+            archive_detail_lines.append(
+                f"• {user_mention} (`{user_tag}`): {change_summary} | 평균: `{avg_str}점`{override_note}\n"
+                f"  └ 투표 내역 ({len(scores)}명): {voter_str}"
+            )
+
             processed_count += 1
 
+        # 1) 아카이브 채널이 지정되어 있으면 전체 투표 상세 내역 영구 기록
+        archived_ok = False
+        if archive_channel_id:
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            archive_report = (
+                f"## 🗂️ [등급 조정 시즌 최종 승인 아카이브]\n"
+                f"- **승인 일시**: `{now_str}`\n"
+                f"- **승인 관리자**: {interaction.user.mention} (`@{interaction.user.name}`)\n"
+                f"- **총 반영 인원**: {processed_count}명\n\n"
+                f"### 📋 대상자별 상세 투표 및 산술평균 기록\n"
+                + "\n".join(archive_detail_lines)
+            )
+            archived_ok = await send_archive_log(
+                guild, archive_channel_id, archive_report
+            )
+
+        # 2) 시즌 종료 및 평가 데이터 즉시 초기화 (다음 시즌에 이전 시즌 평가가 절대 섞이지 않도록 함)
         season["active"] = False
+        season["evaluations"] = {}
         save_config(config)
 
         mention_block = "\n\n".join(announcement_lines_mention)
         username_block = "\n\n".join(announcement_lines_username)
 
+        archive_notice = (
+            f"🗂️ 상세 투표 내역이 아카이브 채널(<#{archive_channel_id}>)에 기록되었으며, 다음 시즌을 위해 현재 평가 데이터는 깨끗이 초기화되었습니다.\n"
+            if archived_ok
+            else "🧹 다음 시즌에 이전 평가가 섞이지 않도록 현재 시즌의 평가 데이터가 자동 초기화되었습니다.\n"
+        )
+
         msg_parts = [
-            f"✅ **총 {processed_count}명의 등급 반영 및 시즌 종료가 완료되었습니다!**\n",
+            f"✅ **총 {processed_count}명의 등급 반영 및 시즌 종료가 완료되었습니다!**",
+            archive_notice,
             "📢 **[공지용 문구 1 — 복사해서 붙여넣으면 실제 멘션(@태그)이 적용됩니다]**",
             f"```text\n{mention_block}\n```",
             "📋 **[공지용 문구 2 — 아이디 텍스트 버전]**",
@@ -696,7 +769,6 @@ async def eval_grade_autocomplete(
     parsed_exact = parse_grade_expression(typed, grades) if typed else None
     if parsed_exact is not None:
         base_c = parsed_exact["base_code"]
-        # 사용자가 특정 등급을 입력 중이면 해당 등급과 +, ++, +++, -, --, --- 변형을 모두 제안
         variants = [
             typed.upper(),
             base_c,
@@ -711,7 +783,6 @@ async def eval_grade_autocomplete(
             if v not in candidate_exprs:
                 candidate_exprs.append(v)
 
-    # 기본 등급 및 자주 쓰는 +/- 변형 추가
     for info in sorted_grades:
         c = info["code"]
         for v in (f"{c}-", c, f"{c}+"):
@@ -727,7 +798,11 @@ async def eval_grade_autocomplete(
             continue
         val_str = format_score(p["value"])
         label = f"{p['display_code']} ({p['role_name']} 계열 / {val_str}점)"
-        if not typed or typed.lower() in label.lower() or p["base_code"].lower() in typed.lower():
+        if (
+            not typed
+            or typed.lower() in label.lower()
+            or p["base_code"].lower() in typed.lower()
+        ):
             choices.append(
                 app_commands.Choice(name=label[:100], value=p["display_code"])
             )
@@ -755,6 +830,7 @@ async def submit_grade_evaluation(
     gs = g["grade_system"]
     season = gs["season"]
     grades = gs["grades"]
+    archive_channel_id = gs.get("archive_channel_id")
 
     # 1. 시즌 활성화 여부 확인
     if not season.get("active"):
@@ -844,6 +920,10 @@ async def submit_grade_evaluation(
             f"🗳️ {user.mention}님이 {대상.mention}님에 대한 등급 평가를 수정했습니다. "
             f"*(현재 {total_evaluators}명 참여)*"
         )
+        archive_msg = (
+            f"✏️ **[투표 수정 기록]** 심사위원 {user.mention}(`@{user.name}`) ➡️ 대상 {대상.mention}(`@{대상.name}`) : "
+            f"`{prev_grade}` ({prev_val}점) ➡️ **`{parsed['display_code']}` ({val_str}점)** *(현재 {total_evaluators}명 참여)*"
+        )
     else:
         private_msg = (
             f"✅ **[본인 확인용]** {대상.mention}님에 대한 등급 평가를 제출했습니다:\n"
@@ -853,11 +933,15 @@ async def submit_grade_evaluation(
             f"🗳️ {user.mention}님이 {대상.mention}님에 대한 등급 평가를 완료했습니다. "
             f"*(현재 {total_evaluators}명 참여)*"
         )
+        archive_msg = (
+            f"📝 **[투표 제출 기록]** 심사위원 {user.mention}(`@{user.name}`) ➡️ 대상 {대상.mention}(`@{대상.name}`) : "
+            f"**`{parsed['display_code']}` ({val_str}점)** *(현재 {total_evaluators}명 참여)*"
+        )
 
     # 1) 평가자 본인에게는 부여한 등급/점수가 포함된 비공개(ephemeral) 확인 메시지 표시
     await interaction.response.send_message(private_msg, ephemeral=True)
 
-    # 2) 채널의 모든 사람에게는 결과(등급/점수) 없이 투표 완료 사실만 공개 메시지로 전송
+    # 2) 평가 채널의 모든 사람에게는 결과(등급/점수) 없이 투표 완료 사실만 공개 메시지로 전송
     if interaction.channel is not None:
         try:
             await interaction.channel.send(
@@ -867,13 +951,19 @@ async def submit_grade_evaluation(
         except discord.HTTPException as e:
             logger.warning(f"투표 완료 공개 메시지 전송 실패: {e}")
 
+    # 3) 아카이브 채널이 지정되어 있고 평가 채널과 다른 곳이면 상세 투표 로그 전송
+    if archive_channel_id and int(archive_channel_id) != getattr(
+        interaction.channel, "id", None
+    ):
+        await send_archive_log(interaction.guild, archive_channel_id, archive_msg)
+
 
 # =====================================================================
 # 명령어 3: /등급관리 (관리자용 설정 · 취합 · 수정 · 최종승인 그룹)
 # =====================================================================
 grade_admin_group = app_commands.Group(
     name="등급관리",
-    description="[관리자용] 등급 등록, 심사위원 자격 세분화, 시즌 시작/종료, 취합 수정 및 최종 승인을 관리합니다.",
+    description="[관리자용] 등급 등록, 심사위원 자격, 아카이브 채널, 시즌 시작/종료, 취합 및 최종 승인을 관리합니다.",
     default_permissions=discord.Permissions(manage_guild=True),
     guild_only=True,
 )
@@ -949,6 +1039,39 @@ async def remove_grade(interaction: discord.Interaction, 등급기호: str):
 
 
 @grade_admin_group.command(
+    name="아카이브채널",
+    description="누가 어떻게 투표했는지 상세 내역을 기록해 둘 아카이브(보관용) 채널을 지정합니다.",
+)
+@app_commands.describe(
+    채널="투표 실명 내역과 최종 취합 기록을 보관할 텍스트 채널 (비워두면 아카이브 해제)"
+)
+async def set_archive_channel(
+    interaction: discord.Interaction,
+    채널: Optional[discord.TextChannel] = None,
+):
+    config = load_config()
+    g = get_guild_data(config, interaction.guild_id)
+    gs = g["grade_system"]
+
+    if 채널 is None:
+        gs["archive_channel_id"] = None
+        save_config(config)
+        await interaction.response.send_message(
+            "ℹ️ 등급 투표 아카이브 채널 지정을 해제했습니다.", ephemeral=True
+        )
+        return
+
+    gs["archive_channel_id"] = 채널.id
+    save_config(config)
+    await interaction.response.send_message(
+        f"🗂️ 등급 투표 아카이브 채널을 {채널.mention}(으)로 설정했습니다!\n"
+        "- 이제 심사위원이 투표(또는 수정)할 때마다 누가 누구에게 몇 점을 주었는지 실시간으로 기록되며,\n"
+        "- `/등급관리 최종승인` 시 시즌 전체 투표 상세 영수증이 해당 채널에 영구 보관됩니다.",
+        ephemeral=True,
+    )
+
+
+@grade_admin_group.command(
     name="심사역할지정",
     description="심사위원 역할을 등록하고, 그 역할이 투표할 수 있는 최대 등급 상한선을 설정합니다.",
 )
@@ -960,8 +1083,12 @@ async def remove_grade(interaction: discord.Interaction, 등급기호: str):
 @app_commands.autocomplete(최대등급=base_grade_autocomplete)
 @app_commands.choices(
     플러스허용=[
-        app_commands.Choice(name="허용 (예: 최대 B 지정 시 B+, B++ 까지 투표 가능)", value=1),
-        app_commands.Choice(name="비허용 (예: 최대 B 지정 시 정확히 B 이하만 투표 가능)", value=0),
+        app_commands.Choice(
+            name="허용 (예: 최대 B 지정 시 B+, B++ 까지 투표 가능)", value=1
+        ),
+        app_commands.Choice(
+            name="비허용 (예: 최대 B 지정 시 정확히 B 이하만 투표 가능)", value=0
+        ),
     ]
 )
 async def set_evaluator_role(
@@ -997,7 +1124,11 @@ async def set_evaluator_role(
     if normalized_max:
         plus_desc = (
             f"`{normalized_max}+`, `{normalized_max}++` 포함"
-            if (플러스허용 == 1 and "+" not in normalized_max and "-" not in normalized_max)
+            if (
+                플러스허용 == 1
+                and "+" not in normalized_max
+                and "-" not in normalized_max
+            )
             else f"`{normalized_max}` 초과 불가"
         )
         limit_msg = f"최대 **`{normalized_max}`** 등급까지만 투표 가능 ({plus_desc})"
@@ -1040,7 +1171,7 @@ async def remove_evaluator_role(
 
 @grade_admin_group.command(
     name="설정목록",
-    description="현재 등록된 등급 목록, 심사위원 역할별 투표 상한선, 시즌 활성화 상태를 확인합니다.",
+    description="현재 등록된 등급 목록, 심사위원 역할별 투표 상한선, 아카이브 채널, 시즌 상태를 확인합니다.",
 )
 async def list_grade_settings(interaction: discord.Interaction):
     config = load_config()
@@ -1048,6 +1179,7 @@ async def list_grade_settings(interaction: discord.Interaction):
     gs = g["grade_system"]
     grades = gs["grades"]
     eval_roles = gs.get("evaluator_roles", {})
+    archive_cid = gs.get("archive_channel_id")
     season = gs["season"]
 
     sorted_grades = sorted(grades.values(), key=lambda x: float(x["value"]))
@@ -1073,7 +1205,11 @@ async def list_grade_settings(interaction: discord.Interaction):
             m_grade = r_conf.get("max_grade")
             allow_p = r_conf.get("allow_plus", True)
             if m_grade:
-                p_note = f" (`{m_grade}+` 포함)" if allow_p and "+" not in m_grade and "-" not in m_grade else ""
+                p_note = (
+                    f" (`{m_grade}+` 포함)"
+                    if allow_p and "+" not in m_grade and "-" not in m_grade
+                    else ""
+                )
                 eval_lines.append(
                     f"- <@&{rid_str}>: 최대 **`{m_grade}`** 까지 투표 가능{p_note}"
                 )
@@ -1084,15 +1220,22 @@ async def list_grade_settings(interaction: discord.Interaction):
         eval_text = "- *(지정된 심사위원 역할 없음 — 현재 서버 관리자만 평가 가능)*"
 
     if season.get("active"):
-        season_text = f"🟢 **진행 중** (지정 채널: <#{season.get('channel_id')}>)"
+        season_text = f"🟢 **진행 중** (평가 채널: <#{season.get('channel_id')}>)"
     else:
         season_text = "⚪ **비활성화됨**"
 
+    archive_text = (
+        f"<#{archive_cid}>"
+        if archive_cid
+        else "*(미지정 — `/등급관리 아카이브채널`로 설정 가능)*"
+    )
+
     msg = (
         f"### ⚙️ 등급 취합 시스템 설정 현황\n"
-        f"**1. 시즌 상태**: {season_text}\n\n"
-        f"**2. 심사위원 역할 및 투표 상한선**:\n{eval_text}\n\n"
-        f"**3. 등록된 기본 등급 목록 (낮은 점수순)**:\n{grade_text}"
+        f"**1. 시즌 상태**: {season_text}\n"
+        f"**2. 아카이브(투표 기록 보관) 채널**: {archive_text}\n\n"
+        f"**3. 심사위원 역할 및 투표 상한선**:\n{eval_text}\n\n"
+        f"**4. 등록된 기본 등급 목록 (낮은 점수순)**:\n{grade_text}"
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
@@ -1103,12 +1246,16 @@ async def list_grade_settings(interaction: discord.Interaction):
 )
 @app_commands.describe(
     채널="등급 평가를 제출받을 채널",
-    기록초기화="새 시즌을 위해 이전 평가 기록을 모두 비울지 여부 (기본값: 예)",
+    기록초기화="새 시즌을 위해 남아있는 평가 기록을 비울지 여부 (기본값: 예)",
 )
 @app_commands.choices(
     기록초기화=[
-        app_commands.Choice(name="예 (새로운 시즌 시작 - 이전 평가 기록 비우기)", value=1),
-        app_commands.Choice(name="아니오 (기존 평가 기록 유지하고 이어서 받기)", value=0),
+        app_commands.Choice(
+            name="예 (새로운 시즌 시작 - 기존 평가 기록 비우기)", value=1
+        ),
+        app_commands.Choice(
+            name="아니오 (잠시 멈췄던 현 시즌 이어서 진행)", value=0
+        ),
     ]
 )
 async def start_grade_season(
@@ -1136,9 +1283,9 @@ async def start_grade_season(
     save_config(config)
 
     reset_msg = (
-        "이전 평가 기록을 초기화하고 새로 시작합니다."
+        "이전 평가 기록을 모두 비우고 새 시즌으로 시작합니다."
         if 기록초기화 == 1
-        else "기존 평가 기록을 유지한 채 이어서 진행합니다."
+        else "잠시 멈췄던 현재 시즌의 평가 기록을 유지한 채 이어서 진행합니다."
     )
     await interaction.response.send_message(
         f"🟢 **등급 조정 시즌이 활성화되었습니다!**\n"
@@ -1151,7 +1298,7 @@ async def start_grade_season(
 
 @grade_admin_group.command(
     name="시즌종료",
-    description="등급 평가 제출을 마감합니다. (취합된 데이터는 그대로 유지되어 검토/수정/최종승인 가능)",
+    description="등급 평가 제출을 마감합니다. (취합된 데이터는 최종승인 전까지 유지됩니다)",
 )
 async def stop_grade_season(interaction: discord.Interaction):
     config = load_config()
@@ -1171,7 +1318,9 @@ async def stop_grade_season(interaction: discord.Interaction):
     name="취합현황",
     description="현재까지 제출된 등급 평가의 산술평균 취합 결과와 예상 공지 문구를 확인합니다.",
 )
-@app_commands.describe(대상="특정 유저의 상세 평가 내역만 보려면 선택하세요 (비워두면 전체 조회)")
+@app_commands.describe(
+    대상="특정 유저의 상세 평가 내역만 보려면 선택하세요 (비워두면 전체 조회)"
+)
 async def view_aggregation_status(
     interaction: discord.Interaction,
     대상: Optional[discord.Member] = None,
@@ -1185,7 +1334,7 @@ async def view_aggregation_status(
 
     if not evaluations:
         await interaction.response.send_message(
-            "📋 아직 제출된 등급 평가가 없습니다.", ephemeral=True
+            "📋 현재 집계 중인 등급 평가가 없습니다.", ephemeral=True
         )
         return
 
@@ -1244,7 +1393,9 @@ async def view_aggregation_status(
         member = guild.get_member(target_id) if guild else None
         scores = t_data.get("scores", {})
 
-        avg_str = f"{avg_val:.3f}".rstrip("0").rstrip(".") if avg_val is not None else "-"
+        avg_str = (
+            f"{avg_val:.3f}".rstrip("0").rstrip(".") if avg_val is not None else "-"
+        )
         override_badge = " 🔧*(수동수정)*" if is_overridden else ""
         indiv = ", ".join(
             f"<@{eid}>:{s['grade']}({format_score(float(s['value']))})"
@@ -1298,7 +1449,9 @@ async def delete_evaluation(
 ):
     config = load_config()
     g = get_guild_data(config, interaction.guild_id)
-    evaluations = g["grade_system"]["season"].get("evaluations", {})
+    gs = g["grade_system"]
+    evaluations = gs["season"].get("evaluations", {})
+    archive_channel_id = gs.get("archive_channel_id")
     target_key = str(대상.id)
 
     if target_key not in evaluations:
@@ -1321,10 +1474,17 @@ async def delete_evaluation(
         if not scores and not evaluations[target_key].get("override_grade"):
             evaluations.pop(target_key, None)
         save_config(config)
+
         await interaction.response.send_message(
             f"🗑️ {심사위원.mention}님이 {대상.mention}님에게 부여했던 **`{removed['grade']}`** 평가를 삭제했습니다.",
             ephemeral=True,
         )
+        if archive_channel_id:
+            await send_archive_log(
+                interaction.guild,
+                archive_channel_id,
+                f"🗑️ **[관리자 평가 삭제]** 관리자 {interaction.user.mention}님이 {대상.mention}님에 대한 {심사위원.mention}님의 평가(**`{removed['grade']}`**)를 삭제했습니다.",
+            )
     else:
         evaluations.pop(target_key, None)
         save_config(config)
@@ -1332,6 +1492,12 @@ async def delete_evaluation(
             f"🗑️ {대상.mention}님에 대한 이번 시즌 모든 평가 및 수동 수정 기록을 삭제했습니다.",
             ephemeral=True,
         )
+        if archive_channel_id:
+            await send_archive_log(
+                interaction.guild,
+                archive_channel_id,
+                f"🗑️ **[관리자 전체 평가 삭제]** 관리자 {interaction.user.mention}님이 {대상.mention}님에 대한 이번 시즌 모든 평가 기록을 삭제했습니다.",
+            )
 
 
 async def override_grade_autocomplete(
@@ -1367,6 +1533,7 @@ async def override_target_grade(
     gs = g["grade_system"]
     grades = gs["grades"]
     evaluations = gs["season"].setdefault("evaluations", {})
+    archive_channel_id = gs.get("archive_channel_id")
     target_key = str(대상.id)
 
     code_input = 변경할등급.strip().upper()
@@ -1380,6 +1547,12 @@ async def override_target_grade(
             f"🔄 {대상.mention}님의 수동 등급 지정을 해제했습니다. 이제 다시 산술평균으로 계산됩니다.",
             ephemeral=True,
         )
+        if archive_channel_id:
+            await send_archive_log(
+                interaction.guild,
+                archive_channel_id,
+                f"🔄 **[관리자 수동 지정 해제]** 관리자 {interaction.user.mention}님이 {대상.mention}님의 수동 등급 지정을 해제(산술평균 복구)했습니다.",
+            )
         return
 
     matched_code = None
@@ -1405,11 +1578,17 @@ async def override_target_grade(
         f"🔧 {대상.mention}님의 최종 취합 등급을 **`{matched_code}` ({g_info['role_name']})**(으)로 수동 지정했습니다.",
         ephemeral=True,
     )
+    if archive_channel_id:
+        await send_archive_log(
+            interaction.guild,
+            archive_channel_id,
+            f"🔧 **[관리자 수동 등급 지정]** 관리자 {interaction.user.mention}님이 {대상.mention}님의 최종 등급을 **`{matched_code}` ({g_info['role_name']})**(으)로 수동 지정했습니다.",
+        )
 
 
 @grade_admin_group.command(
     name="최종승인",
-    description="취합된 등급을 최종 승인하여 유저들의 역할을 일괄 변경하고 공지용 문구를 생성합니다.",
+    description="취합된 등급을 최종 승인하여 역할을 변경하고, 아카이브 기록 후 시즌 데이터를 초기화합니다.",
 )
 async def approve_season(interaction: discord.Interaction):
     config = load_config()
@@ -1417,6 +1596,7 @@ async def approve_season(interaction: discord.Interaction):
     gs = g["grade_system"]
     grades = gs["grades"]
     evaluations = gs["season"].get("evaluations", {})
+    archive_cid = gs.get("archive_channel_id")
 
     if not evaluations:
         await interaction.response.send_message(
@@ -1436,11 +1616,18 @@ async def approve_season(interaction: discord.Interaction):
         )
         return
 
+    archive_line = (
+        f"- 승인 즉시 <#{archive_cid}> 채널에 누가 어떻게 투표했는지 전체 내역이 영구 보관되고, 현재 시즌 평가 데이터는 초기화됩니다.\n"
+        if archive_cid
+        else "- ⚠️ 현재 아카이브 채널이 지정되어 있지 않습니다 (`/등급관리 아카이브채널`로 설정 가능). 승인 즉시 현재 시즌 평가 데이터는 초기화됩니다.\n"
+    )
+
     view = ApproveSeasonView(requester_id=interaction.user.id)
     await interaction.response.send_message(
         f"⚠️ **총 {valid_count}명의 등급 결과를 최종 승인하시겠습니까?**\n"
         "- `[✅ 최종 승인 및 역할 반영]` 버튼을 누르면 대상 유저들의 기존 등급 역할이 새 등급 역할로 즉시 변경되며, 공지용 문구가 출력됩니다.\n"
-        "- *(역할 자동 변경이 정상 작동하려면 서버 설정에서 `Chris Bot`에 **역할 관리** 권한이 있고, `Chris Bot` 역할이 등급 역할들보다 위에 있어야 합니다.)*",
+        + archive_line
+        + "- *(역할 자동 변경이 정상 작동하려면 서버 설정에서 `Chris Bot`에 **역할 관리** 권한이 있고, `Chris Bot` 역할이 등급 역할들보다 위에 있어야 합니다.)*",
         view=view,
         ephemeral=True,
     )
