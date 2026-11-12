@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import random
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -324,6 +325,46 @@ def _is_excluded(channel, settings: dict) -> bool:
 
 
 _last_work_bonus: dict[tuple[int, int], float] = {}
+_floor_checked: set[tuple[int, int]] = set()
+
+
+_LEVEL_ROLE_NAME = re.compile(
+    r"^\s*(?:(\d+)\s*(?:level|lv\.?|lvl|레벨)|(?:level|lv\.?|lvl|레벨)\s*(\d+))\s*$", re.IGNORECASE
+)
+
+
+def parse_level_role_name(name: str) -> Optional[int]:
+    """'10 Level', 'Lv.10', 'LV 10', '레벨 10', '10레벨' → 10 (레벨 역할 이름이 아니면 None)"""
+    m = _LEVEL_ROLE_NAME.match(name)
+    if not m:
+        return None
+    lv = int(m.group(1) or m.group(2))
+    return lv if lv > 0 else None
+
+
+def role_level_floor(member_role_ids: set[int], level_roles: dict) -> int:
+    """멤버가 가진 레벨 역할 중 가장 높은 레벨 (없으면 0)"""
+    return max((int(lv) for lv, rid in level_roles.items() if int(rid) in member_role_ids), default=0)
+
+
+def _apply_role_floor(database: "ActivityDB", member: discord.Member, settings: dict) -> None:
+    """
+    레벨 역할 기준 자동 복원: 이미 가진 레벨 역할(예: Arcane이 준 '5 Level')보다 크리스봇 레벨이 낮으면
+    그 레벨의 시작 경험치까지 올려 줍니다. 101위 이하 Arcane 기록을 역할로 복원하는 용도.
+    레벨 기능이 켜진 뒤(= Arcane 가져오기 이후)에만 작동하고, 멤버당 봇 실행 중 한 번만 확인합니다.
+    """
+    key = (member.guild.id, member.id)
+    if key in _floor_checked or not settings.get("live") or not settings.get("level_roles"):
+        return
+    _floor_checked.add(key)
+    floor_level = role_level_floor({r.id for r in member.roles}, settings["level_roles"])
+    if floor_level <= 0:
+        return
+    floor_xp = total_xp_for_level(floor_level)
+    current = database.get_member(member.guild.id, member.id)["xp"]
+    if current < floor_xp:
+        database.set_xp(member.guild.id, member.id, floor_xp)
+        logger.info(f"레벨 역할 기준 복원: {member} 레벨 {level_from_xp(current)} → {floor_level}")
 
 
 async def handle_message(message: discord.Message) -> None:
@@ -340,6 +381,7 @@ async def handle_message(message: discord.Message) -> None:
     settings = database.get_settings(guild_id)
     if _is_excluded(message.channel, settings):
         return
+    _apply_role_floor(database, message.author, settings)
 
     length = len(message.content or "")
     has_media = any(_is_media(a) for a in message.attachments)
@@ -382,6 +424,7 @@ async def handle_reaction(payload: discord.RawReactionActionEvent, client: disco
     channel = client.get_channel(payload.channel_id)
     if channel is not None and _is_excluded(channel, settings):
         return
+    _apply_role_floor(database, member, settings)
 
     key = (payload.guild_id, member.id)
     now = time.monotonic()
@@ -631,9 +674,10 @@ def register(tree: app_commands.CommandTree) -> None:
         await interaction.response.defer(thinking=True)
         database = get_db()
         gid = interaction.guild_id
+        settings = database.get_settings(gid)
+        _apply_role_floor(database, target, settings)
         m = database.get_member(gid, target.id)
         level, cur, need = level_progress(m["xp"])
-        settings = database.get_settings(gid)
         data = cards.RankCardData(
             display_name=target.display_name,
             username=target.name,
@@ -847,7 +891,10 @@ def register(tree: app_commands.CommandTree) -> None:
                 members = []
             missing += len(chunk) - len(members)
             for member in members:
-                result, _ = await apply_level_roles(member, level_from_xp(chunk[member.id]), settings)
+                # 역할 기준 복원을 먼저 적용해야 '5 Level' 같은 기존 역할을 잘못 회수하지 않음
+                _apply_role_floor(database, member, settings)
+                xp = database.get_member(guild.id, member.id)["xp"]
+                result, _ = await apply_level_roles(member, level_from_xp(xp), settings)
                 counts[result] += 1
                 if result == "changed":
                     await asyncio.sleep(0.5)  # 디스코드 요청 속도 제한 보호
@@ -865,6 +912,33 @@ def register(tree: app_commands.CommandTree) -> None:
                 "*(봇에게 `역할 관리` 권한이 있고, 봇 역할이 레벨 역할들보다 위에 있는지 확인해 주세요)*"
             )
         await interaction.followup.send(text, ephemeral=True)
+
+    @admin.command(
+        name="레벨역할자동등록",
+        description="이름이 '10 Level', 'Lv.10', '레벨 10' 같은 역할을 찾아 레벨 역할로 한 번에 등록합니다.",
+    )
+    async def auto_register_level_roles(interaction: discord.Interaction):
+        database = get_db()
+        s = database.get_settings(interaction.guild_id)
+        found = {}
+        for role in interaction.guild.roles:
+            lv = parse_level_role_name(role.name)
+            if lv is not None and not role.managed:
+                found[lv] = role
+        if not found:
+            await interaction.response.send_message(
+                "ℹ️ 이름에 레벨 숫자가 들어간 역할(예: `10 Level`)을 찾지 못했습니다.", ephemeral=True
+            )
+            return
+        for lv, role in found.items():
+            s["level_roles"][str(lv)] = role.id
+        database.save_settings(interaction.guild_id, s)
+        listed = ", ".join(f"{lv}→{role.mention}" for lv, role in sorted(found.items()))
+        await interaction.response.send_message(
+            f"✅ 레벨 역할 **{len(found)}개**를 등록했습니다: {listed}\n"
+            "*(가장 높은 레벨 역할 하나만 유지됩니다. 전체 정리는 `/레벨관리 역할동기화`)*",
+            ephemeral=True,
+        )
 
     @admin.command(name="레벨역할제거", description="레벨 역할 설정을 지웁니다.")
     async def remove_level_role(interaction: discord.Interaction, 레벨: int):
@@ -945,6 +1019,14 @@ def register(tree: app_commands.CommandTree) -> None:
         if settings.get("arcane_imported"):
             await interaction.response.send_message(
                 f"ℹ️ 이미 Arcane 기록을 가져왔습니다 ({len(settings['arcane_imported'])}명). 두 번 더해지지 않도록 막았습니다.",
+                ephemeral=True,
+            )
+            return
+        if settings.get("live"):
+            # 레벨 기능이 켜지면 '레벨 역할 기준 복원'이 작동하므로, 그 뒤에 가져오면 경험치가 겹칠 수 있음
+            await interaction.response.send_message(
+                "⚠️ 레벨 기능이 이미 켜져 있어 실행하지 않았습니다. Arcane 기록 가져오기는 **레벨 기능을 켜기 전에** 해야 합니다.\n"
+                "`/레벨관리 레벨기능 끄기` → `/레벨관리 아케인가져오기` → `/레벨관리 레벨기능 켜기` 순서로 진행해 주세요.",
                 ephemeral=True,
             )
             return
