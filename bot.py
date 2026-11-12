@@ -10,6 +10,8 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+import activity
+
 # .env 파일에서 환경변수 로드
 load_dotenv()
 
@@ -713,6 +715,9 @@ class SelfStripGradeView(discord.ui.View):
 class ChrisBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
+        # 활동량 감지(글 길이 · 사진/영상 첨부 여부)에 필요합니다.
+        # 디스코드 개발자 포털 → Bot → "Message Content Intent"도 켜져 있어야 합니다.
+        intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -723,8 +728,15 @@ class ChrisBot(discord.Client):
     async def on_ready(self):
         logger.info(f"로그인 성공: {self.user} (ID: {self.user.id})")
 
+    async def on_message(self, message: discord.Message):
+        try:
+            await activity.handle_message(message)
+        except Exception:
+            logger.exception("활동량 기록 중 오류")
+
 
 bot = ChrisBot()
+activity.register(bot.tree)
 
 
 # =====================================================================
