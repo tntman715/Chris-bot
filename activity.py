@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import io
 import json
 import logging
 import random
@@ -16,15 +17,19 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import discord
 from discord import app_commands
+
+import cards
 
 logger = logging.getLogger("Chris-bot.activity")
 
 DB_FILE = Path(__file__).parent / "data" / "chris.db"
 ARCANE_IMPORT_FILE = Path(__file__).parent / "data" / "arcane_import.json"
+GRADE_CONFIG_FILE = Path(__file__).parent / "data" / "config.json"  # bot.py 등급 시스템 설정 (읽기 전용)
+MAX_BADGES = 10
 KST = timezone(timedelta(hours=9))
 
 # ---------------------------------------------------------------------
@@ -51,6 +56,7 @@ DEFAULT_SETTINGS = {
     "announce_channel_id": None,  # 레벨업 알림 채널 (없으면 채팅한 채널)
     "excluded_channels": [],  # 활동량을 세지 않을 채널 (스레드는 상위 채널 기준)
     "level_roles": {},  # "레벨" -> 역할 ID
+    "badge_roles": [],  # /랭크 카드에 뱃지로 보여 줄 역할 ID (등록 순서대로 표시)
 }
 
 
@@ -217,13 +223,20 @@ class ActivityDB:
         ).fetchone()
         return row[0] + 1
 
-    def top_members(self, guild_id: int, column: str, limit: int = 10) -> list[tuple[int, int]]:
+    def top_members(
+        self, guild_id: int, column: str, limit: int = 10, offset: int = 0
+    ) -> list[tuple[int, int]]:
         assert column in ("xp", "coins", "contribution")
         return self.conn.execute(
             f"SELECT user_id, {column} FROM members WHERE guild_id = ? AND {column} > 0 "
-            f"ORDER BY {column} DESC LIMIT ?",
-            (guild_id, limit),
+            f"ORDER BY {column} DESC LIMIT ? OFFSET ?",
+            (guild_id, limit, offset),
         ).fetchall()
+
+    def count_ranked(self, guild_id: int) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM members WHERE guild_id = ? AND xp > 0", (guild_id,)
+        ).fetchone()[0]
 
     def top_recent(self, guild_id: int, since_day: str, limit: int = 10) -> list[tuple[int, int]]:
         return self.conn.execute(
@@ -428,6 +441,68 @@ async def _find_member_by_username(guild: discord.Guild, username: str) -> Optio
     return None
 
 
+# ---------------------------------------------------------------------
+# 이미지 카드용 정보 모으기
+# ---------------------------------------------------------------------
+_avatar_cache: dict[str, bytes] = {}
+
+
+async def _avatar_bytes(user: Union[discord.Member, discord.User]) -> Optional[bytes]:
+    asset = user.display_avatar.replace(size=128, static_format="png")
+    url = str(asset.url)
+    if url in _avatar_cache:
+        return _avatar_cache[url]
+    try:
+        data = await asset.read()
+    except discord.HTTPException:
+        return None
+    if len(_avatar_cache) > 300:
+        _avatar_cache.clear()
+    _avatar_cache[url] = data
+    return data
+
+
+async def _role_badge(role: discord.Role) -> cards.Badge:
+    icon = None
+    if isinstance(role.display_icon, discord.Asset):
+        try:
+            icon = await role.display_icon.replace(size=64, static_format="png").read()
+        except discord.HTTPException:
+            icon = None
+    color = role.color.to_rgb() if role.color.value else cards.GRAY
+    return cards.Badge(role.name, color, icon)
+
+
+async def _grade_badge(member: discord.Member) -> Optional[cards.Badge]:
+    """등급 시스템(/등급관리)에 등록된 등급 역할 중 이 멤버가 가진 가장 높은 등급"""
+    try:
+        config = json.loads(GRADE_CONFIG_FILE.read_text(encoding="utf-8"))
+        grades = config.get(str(member.guild.id), {}).get("grade_system", {}).get("grades", {})
+    except (OSError, ValueError):
+        return None
+    best = None
+    member_role_ids = {r.id for r in member.roles}
+    for info in grades.values():
+        rid = int(info.get("role_id") or 0)
+        if rid in member_role_ids and (best is None or float(info["value"]) > float(best["value"])):
+            best = info
+    if best is None:
+        return None
+    role = member.guild.get_role(int(best["role_id"]))
+    return await _role_badge(role) if role else cards.Badge(best.get("role_name", best["code"]))
+
+
+async def _member_badges(member: discord.Member, settings: dict) -> list[cards.Badge]:
+    member_role_ids = {r.id for r in member.roles}
+    badges = []
+    for rid in settings.get("badge_roles", []):
+        if rid in member_role_ids:
+            role = member.guild.get_role(rid)
+            if role:
+                badges.append(await _role_badge(role))
+    return badges
+
+
 def _split_lines(text: str, limit: int = 1900) -> list[str]:
     chunks, current = [], ""
     for line in text.split("\n"):
@@ -506,6 +581,88 @@ def register(tree: app_commands.CommandTree) -> None:
         lines = [f"{medals.get(i, f'{i}.')} <@{uid}> — {fmt(v)}" for i, (uid, v) in enumerate(rows, 1)]
         await interaction.response.send_message(
             f"### 🏆 {title} 순위\n" + "\n".join(lines), ephemeral=True
+        )
+
+    @tree.command(name="랭크", description="레벨 카드(이미지)를 보여줍니다. 서버 등급과 뱃지도 함께 표시됩니다.")
+    @app_commands.guild_only()
+    @app_commands.describe(유저="확인할 유저 (비워두면 본인)")
+    async def rank_card(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
+        target = 유저 or interaction.user
+        if not isinstance(target, discord.Member):
+            return
+        await interaction.response.defer(thinking=True)
+        database = get_db()
+        gid = interaction.guild_id
+        m = database.get_member(gid, target.id)
+        level, cur, need = level_progress(m["xp"])
+        settings = database.get_settings(gid)
+        data = cards.RankCardData(
+            display_name=target.display_name,
+            username=target.name,
+            avatar=await _avatar_bytes(target),
+            level=level,
+            xp_in_level=cur,
+            xp_needed=need,
+            rank=database.xp_rank(gid, m["xp"]),
+            coins=m["coins"],
+            accent=target.color.to_rgb() if target.color.value else cards.DEFAULT_ACCENT,
+            grade=await _grade_badge(target),
+            badges=await _member_badges(target, settings),
+        )
+        png = await asyncio.to_thread(cards.render_rank_card, data)
+        await interaction.followup.send(file=discord.File(io.BytesIO(png), filename="rank.png"))
+
+    @tree.command(name="리더보드", description="레벨 순위표(이미지)를 보여줍니다. 한 페이지에 10명씩 표시됩니다.")
+    @app_commands.guild_only()
+    @app_commands.describe(페이지="볼 페이지 (1페이지 = 1~10위)")
+    async def leaderboard(interaction: discord.Interaction, 페이지: app_commands.Range[int, 1, 1000] = 1):
+        await interaction.response.defer(thinking=True)
+        database = get_db()
+        guild = interaction.guild
+        total = database.count_ranked(guild.id)
+        pages = max(1, (total + 9) // 10)
+        page = min(페이지, pages)
+        offset = (page - 1) * 10
+        rows = database.top_members(guild.id, "xp", 10, offset)
+        if not rows:
+            await interaction.followup.send("📋 아직 레벨 기록이 없습니다.")
+            return
+
+        ids = [uid for uid, _ in rows]
+        found: dict[int, Union[discord.Member, discord.User]] = {}
+        try:
+            for mem in await guild.query_members(user_ids=ids, limit=100, cache=True):
+                found[mem.id] = mem
+        except (asyncio.TimeoutError, discord.HTTPException) as e:
+            logger.warning(f"리더보드 멤버 조회 실패: {e}")
+        for uid in ids:
+            if uid not in found:
+                user = interaction.client.get_user(uid)
+                if user is None:
+                    try:
+                        user = await interaction.client.fetch_user(uid)
+                    except discord.HTTPException:
+                        user = None
+                if user is not None:
+                    found[uid] = user
+
+        leader_rows = []
+        for i, (uid, xp) in enumerate(rows, start=offset + 1):
+            who = found.get(uid)
+            level, cur, need = level_progress(xp)
+            leader_rows.append(
+                cards.LeaderRow(
+                    rank=i,
+                    name=who.display_name if who else f"알 수 없음 ({uid})",
+                    avatar=await _avatar_bytes(who) if who else None,
+                    level=level,
+                    progress=cur / need if need else 0,
+                )
+            )
+        png = await asyncio.to_thread(cards.render_leaderboard, leader_rows)
+        await interaction.followup.send(
+            f"🏆 **레벨 순위** — {page} / {pages} 페이지",
+            file=discord.File(io.BytesIO(png), filename="leaderboard.png"),
         )
 
     admin = app_commands.Group(
@@ -596,6 +753,38 @@ def register(tree: app_commands.CommandTree) -> None:
         text = f"🗑️ 레벨 {레벨} 역할 설정을 지웠습니다." if removed else f"ℹ️ 레벨 {레벨}에는 설정된 역할이 없습니다."
         await interaction.response.send_message(text, ephemeral=True)
 
+    @admin.command(name="뱃지추가", description="역할을 뱃지로 등록합니다. 그 역할을 가진 사람의 /랭크 카드에 표시됩니다.")
+    @app_commands.describe(역할="뱃지로 보여 줄 역할 (역할 아이콘이 있으면 아이콘이, 없으면 역할 색이 표시됨)")
+    async def add_badge(interaction: discord.Interaction, 역할: discord.Role):
+        database = get_db()
+        s = database.get_settings(interaction.guild_id)
+        badges = s.setdefault("badge_roles", [])
+        if 역할.id in badges:
+            text = f"ℹ️ {역할.mention} 역할은 이미 뱃지로 등록되어 있습니다."
+        elif len(badges) >= 25:
+            text = "❌ 뱃지는 최대 25개까지 등록할 수 있습니다."
+        else:
+            badges.append(역할.id)
+            database.save_settings(interaction.guild_id, s)
+            text = (
+                f"✅ {역할.mention} 역할을 뱃지로 등록했습니다. 이 역할을 가진 사람의 `/랭크` 카드에 표시됩니다.\n"
+                f"*(카드에는 등급 다음에 등록한 순서대로 보이며, 자리가 모자라면 `+N`으로 표시됩니다.)*"
+            )
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @admin.command(name="뱃지제거", description="뱃지로 등록한 역할을 뺍니다.")
+    async def remove_badge(interaction: discord.Interaction, 역할: discord.Role):
+        database = get_db()
+        s = database.get_settings(interaction.guild_id)
+        badges = s.setdefault("badge_roles", [])
+        if 역할.id in badges:
+            badges.remove(역할.id)
+            database.save_settings(interaction.guild_id, s)
+            text = f"🗑️ {역할.mention} 역할을 뱃지 목록에서 뺐습니다."
+        else:
+            text = f"ℹ️ {역할.mention} 역할은 뱃지로 등록되어 있지 않습니다."
+        await interaction.response.send_message(text, ephemeral=True)
+
     @admin.command(name="설정목록", description="레벨 · 활동량 시스템의 현재 설정을 확인합니다.")
     async def show_settings(interaction: discord.Interaction):
         s = get_db().get_settings(interaction.guild_id)
@@ -611,6 +800,8 @@ def register(tree: app_commands.CommandTree) -> None:
             f"- **레벨업 알림 채널**: {announce}\n"
             f"- **활동량 제외 채널**: {excluded}\n"
             f"- **레벨 역할**:\n{role_text}\n"
+            f"- **뱃지 역할** (`/랭크` 카드에 표시): "
+            f"{', '.join(f'<@&{r}>' for r in s.get('badge_roles', [])) or '없음'}\n"
             f"- **지급 규칙**: 채팅은 {XP_COOLDOWN_SECONDS}초에 한 번 경험치 {XP_MIN}~{XP_MAX} + "
             f"{CURRENCY_NAME} {COIN_BASE}개 (긴 글: {bonus}, 사진·영상 +{COIN_MEDIA_BONUS}) / "
             f"반응은 {REACTION_COOLDOWN_SECONDS // 60}분에 한 번 경험치 {REACTION_XP}\n"
