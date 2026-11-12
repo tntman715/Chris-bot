@@ -1,13 +1,15 @@
 """
-스타보드 별 기록 (칼봇 스타보드를 따라 기록)
+스타보드 (칼봇 스타보드 대체)
 
-- 칼봇 스타보드는 그대로 두고, 크리스봇은 "누가 별(⭐)을 몇 개 받았는지"만 따로 기록합니다.
-- 칼봇처럼 별 10개가 안 된(스타보드에 못 오른) 메시지의 별도 셉니다. 본인이 단 별은 세지 않습니다.
-- /스타관리 가져오기 : 스타보드 채널 기록 + 스타보드에 글이 올라온 적 있는 채널 전체를 한 번 훑어 지금까지의 별을 모읍니다.
-  원본이 지워진 메시지는 스타보드에 남은 숫자로 셉니다.
-- 그 뒤로는 ⭐ 반응이 달리고 빠질 때마다 따라 기록합니다 (별 채널 목록 안에서만).
-  칼봇이 새 채널의 글을 스타보드에 올리면 그 채널도 자동으로 목록에 추가합니다.
-- 칼봇 `starboard stats @유저` 답변이 올라오면 그 사람의 "Stars Received" 숫자로 자동 보정합니다 (✅ 반응으로 표시).
+목표: 칼봇 스타보드를 크리스봇이 완전히 대신하는 것 (주인 결정 2026-11-12).
+- 받은 별(⭐) 기록: 별 10개(기준)가 안 된 메시지의 별도 셉니다. 본인 별 · 봇의 별은 세지 않습니다.
+- /스타관리 가져오기 : 칼봇 스타보드 글 + 그 글들이 나온 채널의 기록을 한 번 훑어 지금까지의 별을 모읍니다.
+- 그 뒤로는 ⭐ 반응이 달리고 빠질 때마다 따라 기록합니다 (제외 채널 · 스타보드 채널 빼고 전부).
+- 스타보드 기능(board_live)을 켜면 기준 이상이 된 메시지를 크리스봇이 직접 스타보드 채널에 올리고 숫자를 고칩니다.
+  기준 아래로 내려가거나 원본이 지워지면 크리스봇 글을 지웁니다. 칼봇이 올린 옛 글은 그대로 둡니다.
+  → 칼봇 스타보드를 먼저 끈 다음 켜야 두 번 올라가지 않습니다.
+- 자동별(auto_star)을 켜면 작업물 채널에 사진 · 영상이 올라올 때 크리스봇이 ⭐을 미리 달아 둡니다 (봇의 별은 안 셈).
+- 칼봇 전환 기간에는 칼봇 `starboard stats @유저` 답변으로 자동 보정, `starboard config` 답변으로 기준 · 제외 채널 복사.
 """
 
 import asyncio
@@ -24,12 +26,16 @@ logger = logging.getLogger("Chris-bot.stars")
 
 STAR = "⭐"
 CARL_BOT_ID = 235148962103951360
+DEFAULT_THRESHOLD = 10
+BOARD_COLOR = discord.Color.gold()
 STAR_COUNT_RE = re.compile(r"\*\*(\d+)\*\*")
 JUMP_RE = re.compile(r"discord(?:app)?\.com/channels/\d+/(\d+)/(\d+)")
 AVATAR_ID_RE = re.compile(r"/(?:avatars|users)/(\d+)/")
+CHANNEL_MENTION_RE = re.compile(r"<#(\d+)>")
 PAGE_SIZE = 10
 
 _importing: set[int] = set()  # 가져오기가 진행 중인 서버
+_board_locks: dict[int, asyncio.Lock] = {}  # 같은 메시지를 두 번 올리지 않도록
 
 
 # =====================================================================
@@ -56,6 +62,14 @@ def ensure_tables() -> None:
             delta INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         );
+        -- 스타보드에 올라간 글 (원본 메시지 ID → 스타보드 글 ID). by_carl=1 이면 칼봇이 올린 옛 글
+        CREATE TABLE IF NOT EXISTS star_board (
+            message_id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            board_message_id INTEGER NOT NULL,
+            by_carl INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_star_board_post ON star_board (board_message_id);
         """
     )
     _conn().commit()
@@ -154,20 +168,56 @@ def star_rank(guild_id: int, total: int) -> int:
     ).fetchone()[0] + 1
 
 
-def replace_guild_stars(guild_id: int, rows: dict[int, tuple[int, int, int]]) -> None:
-    """가져오기 결과로 서버의 별 기록을 통째로 바꿉니다. rows: 메시지 ID -> (채널 ID, 작성자 ID, 별). 보정값도 초기화."""
+def replace_guild_stars(guild_id: int, rows: dict[int, tuple[int, int, int]], carl_posts: dict[int, int]) -> None:
+    """
+    가져오기 결과로 서버의 별 기록을 통째로 바꿉니다. 보정값도 초기화.
+    rows: 메시지 ID -> (채널 ID, 작성자 ID, 별), carl_posts: 원본 메시지 ID -> 칼봇 스타보드 글 ID
+    """
     conn = _conn()
     conn.execute("DELETE FROM star_messages WHERE guild_id = ?", (guild_id,))
     conn.execute("DELETE FROM star_adjust WHERE guild_id = ?", (guild_id,))
+    conn.execute("DELETE FROM star_board WHERE guild_id = ? AND by_carl = 1", (guild_id,))
     conn.executemany(
         "INSERT OR REPLACE INTO star_messages (message_id, guild_id, channel_id, author_id, stars) VALUES (?, ?, ?, ?, ?)",
         [(mid, guild_id, ch, author, max(0, st)) for mid, (ch, author, st) in rows.items()],
     )
+    conn.executemany(
+        "INSERT OR IGNORE INTO star_board (message_id, guild_id, board_message_id, by_carl) VALUES (?, ?, ?, 1)",
+        [(mid, guild_id, post) for mid, post in carl_posts.items()],
+    )
     conn.commit()
 
 
+def get_board(message_id: int) -> Optional[dict]:
+    row = _conn().execute(
+        "SELECT guild_id, board_message_id, by_carl FROM star_board WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    return dict(zip(("guild_id", "board_message_id", "by_carl"), row)) if row else None
+
+
+def get_board_by_post(board_message_id: int) -> Optional[int]:
+    row = _conn().execute(
+        "SELECT message_id FROM star_board WHERE board_message_id = ?", (board_message_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def set_board(guild_id: int, message_id: int, board_message_id: int, by_carl: bool) -> None:
+    _conn().execute(
+        "INSERT INTO star_board (message_id, guild_id, board_message_id, by_carl) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(message_id) DO UPDATE SET board_message_id = excluded.board_message_id, by_carl = excluded.by_carl",
+        (message_id, guild_id, board_message_id, int(by_carl)),
+    )
+    _conn().commit()
+
+
+def remove_board(message_id: int) -> None:
+    _conn().execute("DELETE FROM star_board WHERE message_id = ?", (message_id,))
+    _conn().commit()
+
+
 # =====================================================================
-# 칼봇 메시지 읽기 (디스코드와 무관한 순수 함수 — 테스트 가능)
+# 순수 함수 (디스코드와 무관 — 테스트 가능)
 # =====================================================================
 def parse_board_post(content: str, icon_url: Optional[str], field_values: list[str], footer: Optional[str]) -> Optional[dict]:
     """
@@ -208,6 +258,39 @@ def parse_carl_stats(fields: dict[str, str], icon_url: Optional[str]) -> Optiona
     return (int(uid.group(1)) if uid else None), int(digits)
 
 
+def parse_carl_config(content: str) -> Optional[tuple[int, list[int]]]:
+    """칼봇 `starboard config` 답변 → (기준 별 수, 제외 채널 ID 목록)"""
+    m = re.search(r"\*\*Threshold:\*\*\s*(\d+)", content or "")
+    if not m:
+        return None
+    black = re.search(r"\*\*Blacklisted channels:\*\*([^\n]*)", content)
+    ids = [int(x) for x in CHANNEL_MENTION_RE.findall(black.group(1))] if black else []
+    return int(m.group(1)), ids
+
+
+def plan_board(stars: int, threshold: int, entry: Optional[dict]) -> Optional[str]:
+    """스타보드에서 할 일: 'post'(새로 올림) · 'edit'(숫자 고침) · 'remove'(지움) · None"""
+    if entry and entry["by_carl"]:
+        return None  # 칼봇이 올린 옛 글은 건드리지 않음
+    if stars >= threshold:
+        return "edit" if entry else "post"
+    return "remove" if entry else None
+
+
+def board_content(stars: int, channel_id: int) -> str:
+    return f"{STAR} **{stars}** <#{channel_id}>"
+
+
+def is_excluded(channel_id: int, parent_id: Optional[int], s: dict) -> bool:
+    if channel_id == s.get("star_board_channel"):
+        return True
+    excluded = set(s.get("star_excluded_channels") or [])
+    return channel_id in excluded or (parent_id is not None and parent_id in excluded)
+
+
+# =====================================================================
+# 칼봇 메시지 읽기
+# =====================================================================
 def _board_from_message(message: discord.Message) -> Optional[dict]:
     if not message.embeds:
         return None
@@ -241,29 +324,108 @@ async def _member_by_display_name(guild: discord.Guild, name: str) -> Optional[d
 
 
 # =====================================================================
-# 실시간 기록
+# 크리스봇 스타보드 (board_live 가 켜져 있을 때)
 # =====================================================================
 def _settings(guild_id: int) -> dict:
     return activity.get_db().get_settings(guild_id)
 
 
-def _tracked(client: discord.Client, guild_id: int, channel_id: int, s: dict) -> bool:
-    if not s.get("stars_imported") or channel_id == s.get("star_board_channel"):
+def threshold_of(s: dict) -> int:
+    return int(s.get("star_threshold") or DEFAULT_THRESHOLD)
+
+
+async def _get_channel(guild: discord.Guild, channel_id: int):
+    channel = guild.get_channel_or_thread(channel_id)
+    if channel is None:
+        channel = await guild.fetch_channel(channel_id)
+    return channel
+
+
+async def _build_board_post(message: discord.Message, stars: int) -> tuple[str, discord.Embed, list[discord.File]]:
+    embed = discord.Embed(description=(message.content or "")[:4000] or None, color=BOARD_COLOR, timestamp=message.created_at)
+    embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
+    embed.add_field(name="원본", value=f"[바로가기]({message.jump_url})")
+    embed.set_footer(text=str(message.id))
+    files: list[discord.File] = []
+    limit = message.guild.filesize_limit if message.guild else 8 * 1024 * 1024
+    # 사진 · 영상은 다시 올려서 붙입니다 (원본 링크는 시간이 지나면 만료될 수 있음)
+    for att in message.attachments:
+        if not activity._is_media(att) or att.size > limit or files:
+            continue
+        try:
+            f = await att.to_file()
+        except discord.HTTPException:
+            continue
+        files.append(f)
+        if (att.content_type or "").startswith("image/") or att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            embed.set_image(url=f"attachment://{f.filename}")
+    if not files:
+        for e in message.embeds:  # 링크 미리보기 이미지
+            url = (e.image and e.image.url) or (e.thumbnail and e.thumbnail.url)
+            if url:
+                embed.set_image(url=url)
+                break
+    return board_content(stars, message.channel.id), embed, files
+
+
+async def sync_board(guild: discord.Guild, message_id: int) -> None:
+    """메시지의 별 수에 맞춰 크리스봇 스타보드 글을 올리거나 · 고치거나 · 지웁니다."""
+    s = _settings(guild.id)
+    board_id = s.get("star_board_channel")
+    if not s.get("board_live") or not board_id:
+        return
+    row = get_message(message_id)
+    stars = row["stars"] if row else 0
+    if plan_board(stars, threshold_of(s), get_board(message_id)) is None:
+        return
+    lock = _board_locks.setdefault(message_id, asyncio.Lock())
+    async with lock:
+        entry = get_board(message_id)  # 기다리는 동안 바뀌었을 수 있음
+        row = get_message(message_id)
+        stars = row["stars"] if row else 0
+        action = plan_board(stars, threshold_of(s), entry)
+        board = guild.get_channel(board_id)
+        if action is None or board is None:
+            return
+        try:
+            if action == "post":
+                original = await (await _get_channel(guild, row["channel_id"])).fetch_message(message_id)
+                content, embed, files = await _build_board_post(original, stars)
+                post = await board.send(content, embed=embed, files=files, allowed_mentions=discord.AllowedMentions.none())
+                set_board(guild.id, message_id, post.id, by_carl=False)
+            elif action == "edit":
+                await board.get_partial_message(entry["board_message_id"]).edit(
+                    content=board_content(stars, row["channel_id"])
+                )
+            elif action == "remove":
+                remove_board(message_id)
+                await board.get_partial_message(entry["board_message_id"]).delete()
+        except discord.NotFound:
+            if action == "edit":  # 누가 스타보드 글을 지웠음 → 기록도 지움
+                remove_board(message_id)
+        except discord.HTTPException as e:
+            logger.warning(f"스타보드 {action} 실패 ({message_id}): {e}")
+    if not lock.locked():
+        _board_locks.pop(message_id, None)
+
+
+# =====================================================================
+# 실시간 기록
+# =====================================================================
+def _tracked(client: discord.Client, channel_id: int, s: dict) -> bool:
+    if not s.get("stars_imported"):
         return False
-    ids = set(s.get("star_channels") or [])
-    if channel_id in ids:
-        return True
     channel = client.get_channel(channel_id)
-    return channel is not None and getattr(channel, "parent_id", None) in ids
+    return not is_excluded(channel_id, getattr(channel, "parent_id", None), s)
 
 
 async def handle_reaction_add(payload: discord.RawReactionActionEvent, client: discord.Client) -> None:
     if payload.guild_id is None or str(payload.emoji) != STAR:
         return
     s = _settings(payload.guild_id)
-    if not _tracked(client, payload.guild_id, payload.channel_id, s):
+    if not _tracked(client, payload.channel_id, s):
         return
-    if payload.member is not None and payload.member.bot:
+    if payload.member is not None and payload.member.bot:  # 자동별 등 봇의 별은 안 셈
         return
     author_id = getattr(payload, "message_author_id", None)
     row = get_message(payload.message_id)
@@ -272,68 +434,103 @@ async def handle_reaction_add(payload: discord.RawReactionActionEvent, client: d
     if author_id is None or payload.user_id == author_id:  # 본인 별은 세지 않음
         return
     change_stars(payload.guild_id, payload.channel_id, payload.message_id, author_id, +1)
+    guild = client.get_guild(payload.guild_id)
+    if guild:
+        await sync_board(guild, payload.message_id)
 
 
 async def handle_reaction_remove(payload: discord.RawReactionActionEvent, client: discord.Client) -> None:
     if payload.guild_id is None or str(payload.emoji) != STAR:
         return
     s = _settings(payload.guild_id)
-    if not _tracked(client, payload.guild_id, payload.channel_id, s):
+    if not _tracked(client, payload.channel_id, s):
         return
     row = get_message(payload.message_id)
-    if row is None or payload.user_id == row["author_id"]:
+    if row is None or payload.user_id == row["author_id"] or payload.user_id == getattr(client.user, "id", None):
         return
     change_stars(payload.guild_id, payload.channel_id, payload.message_id, None, -1)
+    guild = client.get_guild(payload.guild_id)
+    if guild:
+        await sync_board(guild, payload.message_id)
 
 
-async def handle_reaction_clear(guild_id: Optional[int], message_id: int, emoji=None) -> None:
+async def handle_reaction_clear(client: discord.Client, guild_id: Optional[int], message_id: int, emoji=None) -> None:
     """관리자가 반응을 모두 지운 경우"""
     if guild_id is None or (emoji is not None and str(emoji) != STAR):
         return
     row = get_message(message_id)
     if row:
         set_message_stars(row["guild_id"], row["channel_id"], message_id, row["author_id"], 0)
+        guild = client.get_guild(guild_id)
+        if guild:
+            await sync_board(guild, message_id)
+
+
+async def handle_message_delete(payload: discord.RawMessageDeleteEvent, client: discord.Client) -> None:
+    """원본이 지워지면 크리스봇 스타보드 글도 지움 (받은 별 기록은 유지). 스타보드 글이 지워지면 연결만 지움."""
+    if payload.guild_id is None:
+        return
+    entry = get_board(payload.message_id)
+    if entry:
+        remove_board(payload.message_id)
+        s = _settings(payload.guild_id)
+        board = client.get_channel(s.get("star_board_channel") or 0)
+        if board is not None and not entry["by_carl"]:
+            try:
+                await board.get_partial_message(entry["board_message_id"]).delete()
+            except discord.HTTPException:
+                pass
+        return
+    original = get_board_by_post(payload.message_id)
+    if original is not None:
+        remove_board(original)
 
 
 async def handle_message(message: discord.Message) -> None:
-    """칼봇 메시지만 봅니다: 새 스타보드 글 · `starboard stats` 답변"""
-    if message.guild is None or message.author.id != CARL_BOT_ID:
+    if message.guild is None:
         return
     s = _settings(message.guild.id)
-    if not s.get("stars_imported"):
+    if message.author.id == CARL_BOT_ID:
+        if not s.get("stars_imported"):
+            return
+        if message.channel.id == s.get("star_board_channel"):
+            await _on_carl_board_post(message, s)
+            return
+        stats = _carl_stats_from_message(message)
+        if stats:
+            await _apply_carl_stats(message, stats)
         return
-    if message.channel.id == s.get("star_board_channel"):
-        await _on_board_post(message, s)
-        return
-    stats = _carl_stats_from_message(message)
-    if stats:
-        await _apply_carl_stats(message, stats)
+    # 자동별: 작업물 채널에 사진 · 영상이 올라오면 ⭐을 미리 달아 둠
+    if (
+        s.get("auto_star")
+        and not message.author.bot
+        and activity._in_channels(message.channel, s.get("work_channels"))
+        and any(activity._is_media(a) for a in message.attachments)
+    ):
+        try:
+            await message.add_reaction(STAR)
+        except discord.HTTPException as e:
+            logger.warning(f"자동별 실패: {e}")
 
 
-async def _on_board_post(message: discord.Message, s: dict) -> None:
+async def _on_carl_board_post(message: discord.Message, s: dict) -> None:
+    """칼봇이 아직 켜져 있는 동안 칼봇이 올린 스타보드 글을 따라 기록"""
     p = _board_from_message(message)
     if not p:
         return
     guild = message.guild
-    # 새 채널에서 올라온 글이면 그 채널도 별 채널 목록에 추가
-    chans = s.setdefault("star_channels", [])
-    if p["channel_id"] not in chans:
-        channel = guild.get_channel_or_thread(p["channel_id"])
-        parent = getattr(channel, "parent_id", None)
-        if parent not in chans:
-            chans.append(p["channel_id"])
-            activity.get_db().save_settings(guild.id, s)
     author_id = p["author_id"]
     if author_id is None:
         row = get_message(p["message_id"])
         author_id = row["author_id"] if row else None
     if author_id is None:
         try:
-            channel = guild.get_channel_or_thread(p["channel_id"]) or await guild.fetch_channel(p["channel_id"])
-            author_id = (await channel.fetch_message(p["message_id"])).author.id
+            author_id = (await (await _get_channel(guild, p["channel_id"])).fetch_message(p["message_id"])).author.id
         except (discord.HTTPException, AttributeError):
             return
     set_message_stars(guild.id, p["channel_id"], p["message_id"], author_id, p["stars"])
+    if get_board(p["message_id"]) is None:
+        set_board(guild.id, p["message_id"], message.id, by_carl=True)
 
 
 async def _apply_carl_stats(message: discord.Message, stats: tuple[Optional[int], int, str]) -> Optional[tuple[int, int, int]]:
@@ -366,7 +563,7 @@ async def import_stars(guild: discord.Guild, board: discord.TextChannel, progres
     """
     1) 스타보드 채널의 칼봇 글을 모두 읽고 (원본 위치 · 별 수 · 작성자)
     2) 그 글들이 나온 채널의 기록을 처음부터 훑어 ⭐ 달린 메시지를 셉니다.
-       스타보드에 오른 메시지는 칼봇 숫자 그대로, 못 오른 메시지는 ⭐ 수에서 본인 별을 뺍니다.
+       스타보드에 오른 메시지는 칼봇 숫자 그대로, 못 오른 메시지는 ⭐ 수에서 본인 별 · 크리스봇 별을 뺍니다.
     3) 원본이 지워진 메시지는 스타보드 숫자로 셉니다.
     """
     board_posts: dict[int, dict] = {}
@@ -376,15 +573,16 @@ async def import_stars(guild: discord.Guild, board: discord.TextChannel, progres
         p = _board_from_message(m)
         if p and p["message_id"] not in board_posts:  # 최신 글 우선
             p["name"] = (m.embeds[0].author.name if m.embeds[0].author else "") or ""
+            p["post_id"] = m.id
             board_posts[p["message_id"]] = p
     await progress(f"스타보드 글 {len(board_posts):,}개를 읽었습니다. 원래 채널을 훑는 중...")
 
     sources = sorted({p["channel_id"] for p in board_posts.values()})
     rows: dict[int, tuple[int, int, int]] = {}
-    scanned_channels, scanned_messages = [], 0
+    scanned_channels, scanned_messages = 0, 0
     for i, cid in enumerate(sources, 1):
         try:
-            channel = guild.get_channel_or_thread(cid) or await guild.fetch_channel(cid)
+            channel = await _get_channel(guild, cid)
         except discord.HTTPException:
             continue  # 지워진 채널 — 스타보드 숫자로 셈
         if not hasattr(channel, "history"):
@@ -398,12 +596,14 @@ async def import_stars(guild: discord.Guild, board: discord.TextChannel, progres
                 if m.id in board_posts:
                     stars = board_posts[m.id]["stars"]
                 else:
-                    stars = reaction.count - (1 if await _self_starred(reaction, m.author.id) else 0)
+                    stars = reaction.count - (1 if reaction.me else 0)
+                    if stars > 0 and await _self_starred(reaction, m.author.id):
+                        stars -= 1
                 if stars > 0:
                     rows[m.id] = (channel.id, m.author.id, stars)
         except discord.Forbidden:
             continue
-        scanned_channels.append(cid)
+        scanned_channels += 1
         await progress(f"채널 {i}/{len(sources)} 확인 (메시지 {scanned_messages:,}개, 별 받은 메시지 {len(rows):,}개)")
 
     # 원본이 지워졌거나 읽지 못한 스타보드 글
@@ -420,15 +620,14 @@ async def import_stars(guild: discord.Guild, board: discord.TextChannel, progres
             continue
         rows[mid] = (p["channel_id"], author_id, p["stars"])
 
-    replace_guild_stars(guild.id, rows)
+    replace_guild_stars(guild.id, rows, {mid: p["post_id"] for mid, p in board_posts.items()})
     s = _settings(guild.id)
     s["star_board_channel"] = board.id
-    s["star_channels"] = sorted(set(s.get("star_channels") or []) | set(scanned_channels))
     s["stars_imported"] = True
     activity.get_db().save_settings(guild.id, s)
     return {
         "board_posts": len(board_posts),
-        "channels": len(scanned_channels),
+        "channels": scanned_channels,
         "messages": scanned_messages,
         "starred": len(rows),
         "stars": sum(r[2] for r in rows.values()),
@@ -440,6 +639,17 @@ async def import_stars(guild: discord.Guild, board: discord.TextChannel, progres
 # =====================================================================
 # 명령어
 # =====================================================================
+ON_OFF = [app_commands.Choice(name="켜기", value=1), app_commands.Choice(name="끄기", value=0)]
+
+
+async def _send_chunks(interaction: discord.Interaction, text: str) -> None:
+    for i, chunk in enumerate(activity._split_lines(text)):
+        if i == 0 and not interaction.response.is_done():
+            await interaction.response.send_message(chunk, ephemeral=True)
+        else:
+            await interaction.followup.send(chunk, ephemeral=True)
+
+
 def register(tree: app_commands.CommandTree) -> None:
     ensure_tables()
 
@@ -470,22 +680,22 @@ def register(tree: app_commands.CommandTree) -> None:
 
     admin = app_commands.Group(
         name="스타관리",
-        description="[관리자용] 스타보드 별 기록을 관리합니다.",
+        description="[관리자용] 스타보드와 별 기록을 관리합니다.",
         default_permissions=discord.Permissions(manage_guild=True),
         guild_only=True,
     )
 
     @admin.command(name="가져오기", description="칼봇 스타보드와 원래 채널을 훑어 지금까지 받은 별을 모읍니다. (몇 분~수십 분)")
-    @app_commands.describe(스타보드채널="칼봇 스타보드 채널")
+    @app_commands.describe(스타보드채널="스타보드 채널 (칼봇이 쓰던 채널 — 크리스봇도 여기에 올립니다)")
     async def import_cmd(interaction: discord.Interaction, 스타보드채널: discord.TextChannel):
         guild = interaction.guild
         if guild.id in _importing:
-            await interaction.response.send_message("⏳ 이미 가져오는 중입니다. 끝나면 이 채널에 알려 드립니다.", ephemeral=True)
+            await interaction.response.send_message("⏳ 이미 가져오는 중입니다. 끝나면 진행 메시지에 표시됩니다.", ephemeral=True)
             return
         _importing.add(guild.id)
         await interaction.response.send_message(
             f"⏳ {스타보드채널.mention}과 원래 채널을 훑기 시작합니다. 진행 상황은 아래 메시지에 표시됩니다.\n"
-            "다시 가져오면 이전 기록과 보정값은 지워지고 새로 계산됩니다.",
+            "다시 가져오면 이전 별 기록과 보정값은 지워지고 새로 계산됩니다.",
             ephemeral=True,
         )
         status = await interaction.channel.send("⭐ 별 기록 가져오는 중...")
@@ -514,39 +724,102 @@ def register(tree: app_commands.CommandTree) -> None:
             text += f"\n- 작성자를 찾지 못한 스타보드 글 {r['unknown']}개는 빠졌습니다 (원본 삭제 + 기본 프로필)."
         await status.edit(content=text)
 
-    @admin.command(name="칼봇맞추기", description="이 채널의 최근 칼봇 `starboard stats` 답변을 읽어 그 사람들의 별 수를 칼봇과 맞춥니다.")
-    @app_commands.describe(채널="칼봇 stats 답변이 있는 채널 (비워두면 현재 채널)")
+    @admin.command(name="칼봇맞추기", description="채널의 최근 칼봇 starboard stats · config 답변을 읽어 별 수 · 기준 · 제외 채널을 맞춥니다.")
+    @app_commands.describe(채널="칼봇 답변이 있는 채널 (비워두면 현재 채널)")
     async def carl_sync(interaction: discord.Interaction, 채널: Optional[discord.TextChannel] = None):
         guild = interaction.guild
         channel = 채널 or interaction.channel
-        if not _settings(guild.id).get("stars_imported"):
+        s = _settings(guild.id)
+        if not s.get("stars_imported"):
             await interaction.response.send_message("❌ 먼저 `/스타관리 가져오기`를 실행해 주세요.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        results, missed = {}, 0
-        async for m in channel.history(limit=300, oldest_first=False):
+        results, missed, config = {}, 0, None
+        async for m in channel.history(limit=300):  # 최신 메시지부터
             if m.author.id != CARL_BOT_ID:
                 continue
+            if config is None:
+                config = parse_carl_config(m.content)
             stats = _carl_stats_from_message(m)
-            if not stats:
-                continue
-            uid = stats[0]
-            if uid is not None and uid in results:  # 같은 사람은 가장 최근 답변만
+            if not stats or (stats[0] is not None and stats[0] in results):  # 같은 사람은 가장 최근 답변만
                 continue
             r = await _apply_carl_stats(m, stats)
             if r is None:
                 missed += 1
-                continue
-            results.setdefault(r[0], r)
-        if not results:
-            await interaction.followup.send("📋 칼봇 `starboard stats @유저` 답변을 찾지 못했습니다.", ephemeral=True)
-            return
-        lines = [f"- <@{uid}>: {before:,} → **{after:,}**" for uid, before, after in results.values()]
-        text = f"✅ {len(results)}명의 별 수를 칼봇과 맞췄습니다.\n" + "\n".join(lines)
+            else:
+                results.setdefault(r[0], r)
+        lines = []
+        if config:
+            s["star_threshold"], s["star_excluded_channels"] = config[0], config[1]
+            activity.get_db().save_settings(guild.id, s)
+            lines.append(f"✅ 칼봇 설정을 복사했습니다: 기준 **{config[0]}개**, 제외 채널 {len(config[1])}개")
+        if results:
+            lines.append(f"✅ {len(results)}명의 별 수를 칼봇과 맞췄습니다.")
+            lines += [f"- <@{uid}>: {before:,} → **{after:,}**" for uid, before, after in results.values()]
         if missed:
-            text += f"\n- 누구인지 알 수 없는 답변 {missed}개는 건너뛰었습니다. `/스타관리 보정`으로 직접 맞춰 주세요."
-        for chunk in activity._split_lines(text):
+            lines.append(f"- 누구인지 알 수 없는 답변 {missed}개는 건너뛰었습니다. `/스타관리 보정`으로 직접 맞춰 주세요.")
+        if not lines:
+            lines.append("📋 칼봇 `starboard stats @유저` · `starboard config` 답변을 찾지 못했습니다.")
+        for chunk in activity._split_lines("\n".join(lines)):
             await interaction.followup.send(chunk, ephemeral=True)
+
+    @admin.command(name="스타보드기능", description="크리스봇이 스타보드에 직접 올리는 기능을 켜거나 끕니다. (칼봇 스타보드를 먼저 끄세요)")
+    @app_commands.choices(상태=ON_OFF)
+    async def toggle_board(interaction: discord.Interaction, 상태: int):
+        s = _settings(interaction.guild_id)
+        if 상태 and not (s.get("stars_imported") and s.get("star_board_channel")):
+            await interaction.response.send_message("❌ 먼저 `/스타관리 가져오기`를 실행해 주세요.", ephemeral=True)
+            return
+        s["board_live"] = bool(상태)
+        activity.get_db().save_settings(interaction.guild_id, s)
+        if 상태:
+            msg = (
+                f"✅ 이제 별 **{threshold_of(s)}개** 이상 받은 메시지를 크리스봇이 <#{s['star_board_channel']}>에 올립니다.\n"
+                "⚠️ 칼봇 스타보드가 켜져 있으면 두 번 올라갑니다. 칼봇 스타보드를 꺼 주세요. (칼봇이 올린 옛 글은 그대로 둡니다)"
+            )
+        else:
+            msg = "⏸️ 크리스봇 스타보드 올리기를 껐습니다. (별 기록은 계속됩니다)"
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @admin.command(name="자동별", description="작업물 채널에 사진·영상이 올라오면 크리스봇이 ⭐을 미리 달아 둡니다. (봇의 별은 안 셈)")
+    @app_commands.choices(상태=ON_OFF)
+    async def toggle_auto(interaction: discord.Interaction, 상태: int):
+        s = _settings(interaction.guild_id)
+        s["auto_star"] = bool(상태)
+        activity.get_db().save_settings(interaction.guild_id, s)
+        chans = s.get("work_channels") or []
+        if 상태:
+            msg = f"✅ 자동별을 켰습니다. 작업물 채널 {len(chans)}개 (`/레벨관리 작업물채널추가`로 정한 채널)에 적용됩니다."
+            if not chans:
+                msg += "\n⚠️ 작업물 채널이 없습니다. `/레벨관리 작업물채널추가`로 먼저 정해 주세요."
+        else:
+            msg = "⏸️ 자동별을 껐습니다."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @admin.command(name="기준", description="스타보드에 올라갈 별 개수 기준을 정합니다. (칼봇 기본 10)")
+    async def set_threshold(interaction: discord.Interaction, 개수: app_commands.Range[int, 1, 100]):
+        s = _settings(interaction.guild_id)
+        s["star_threshold"] = 개수
+        activity.get_db().save_settings(interaction.guild_id, s)
+        await interaction.response.send_message(f"✅ 스타보드 기준을 별 **{개수}개**로 정했습니다.", ephemeral=True)
+
+    @admin.command(name="제외채널추가", description="별을 세지 않고 스타보드에도 올리지 않을 채널을 추가합니다.")
+    async def add_excluded(interaction: discord.Interaction, 채널: discord.abc.GuildChannel):
+        s = _settings(interaction.guild_id)
+        chans = s.setdefault("star_excluded_channels", [])
+        if 채널.id not in chans:
+            chans.append(채널.id)
+            activity.get_db().save_settings(interaction.guild_id, s)
+        await interaction.response.send_message(f"✅ {채널.mention}을 별 제외 채널에 추가했습니다.", ephemeral=True)
+
+    @admin.command(name="제외채널제거", description="별 제외 채널 목록에서 뺍니다.")
+    async def remove_excluded(interaction: discord.Interaction, 채널: discord.abc.GuildChannel):
+        s = _settings(interaction.guild_id)
+        chans = s.setdefault("star_excluded_channels", [])
+        if 채널.id in chans:
+            chans.remove(채널.id)
+            activity.get_db().save_settings(interaction.guild_id, s)
+        await interaction.response.send_message(f"🗑️ {채널.mention}을 별 제외 채널에서 뺐습니다.", ephemeral=True)
 
     @admin.command(name="보정", description="유저가 받은 별 합계를 직접 정합니다. (칼봇 숫자와 맞출 때)")
     @app_commands.describe(유저="대상 유저", 별수="받은 별 합계")
@@ -556,27 +829,28 @@ def register(tree: app_commands.CommandTree) -> None:
             f"✅ {유저.mention}님의 받은 별: {before:,} → **{별수:,}**", ephemeral=True
         )
 
-    @admin.command(name="설정목록", description="별 기록 설정과 현황을 봅니다.")
+    @admin.command(name="설정목록", description="스타보드 설정과 별 기록 현황을 봅니다.")
     async def show(interaction: discord.Interaction):
         gid = interaction.guild_id
         s = _settings(gid)
         board = s.get("star_board_channel")
-        chans = s.get("star_channels") or []
+        excluded = s.get("star_excluded_channels") or []
         totals = _conn().execute(
             "SELECT COUNT(*), COALESCE(SUM(stars), 0) FROM star_messages WHERE guild_id = ? AND stars > 0", (gid,)
         ).fetchone()
         adjusted = _conn().execute("SELECT COUNT(*) FROM star_adjust WHERE guild_id = ?", (gid,)).fetchone()[0]
+        posts = _conn().execute(
+            "SELECT COALESCE(SUM(by_carl = 0), 0), COALESCE(SUM(by_carl = 1), 0) FROM star_board WHERE guild_id = ?", (gid,)
+        ).fetchone()
         text = (
-            f"### {STAR} 별 기록 설정\n"
-            f"- 기록: {'켜짐' if s.get('stars_imported') else '꺼짐 (`/스타관리 가져오기` 전)'}\n"
-            f"- 스타보드 채널: {f'<#{board}>' if board else '없음'}\n"
-            f"- 별을 세는 채널 ({len(chans)}개): {' '.join(f'<#{c}>' for c in chans) or '없음'}\n"
-            f"- 별 받은 메시지 {totals[0]:,}개, 별 합계 {totals[1]:,}개 (보정한 사람 {adjusted}명)"
+            f"### {STAR} 스타보드 설정\n"
+            f"- 별 기록: {'켜짐' if s.get('stars_imported') else '꺼짐 (`/스타관리 가져오기` 전)'}\n"
+            f"- 크리스봇 스타보드 올리기: {'켜짐' if s.get('board_live') else '꺼짐'} · 자동별: {'켜짐' if s.get('auto_star') else '꺼짐'}\n"
+            f"- 스타보드 채널: {f'<#{board}>' if board else '없음'} · 기준: 별 {threshold_of(s)}개\n"
+            f"- 제외 채널 ({len(excluded)}개): {' '.join(f'<#{c}>' for c in excluded) or '없음'}\n"
+            f"- 별 받은 메시지 {totals[0]:,}개, 별 합계 {totals[1]:,}개 (보정한 사람 {adjusted}명)\n"
+            f"- 스타보드 글: 크리스봇 {posts[0]:,}개 · 칼봇(옛 글) {posts[1]:,}개"
         )
-        for i, chunk in enumerate(activity._split_lines(text)):
-            if i == 0:
-                await interaction.response.send_message(chunk, ephemeral=True)
-            else:
-                await interaction.followup.send(chunk, ephemeral=True)
+        await _send_chunks(interaction, text)
 
     tree.add_command(admin)

@@ -758,15 +758,21 @@ class ChrisBot(discord.Client):
 
     async def on_raw_reaction_clear(self, payload: discord.RawReactionClearEvent):
         try:
-            await stars.handle_reaction_clear(payload.guild_id, payload.message_id)
+            await stars.handle_reaction_clear(self, payload.guild_id, payload.message_id)
         except Exception:
             logger.exception("별 기록 중 오류")
 
     async def on_raw_reaction_clear_emoji(self, payload: discord.RawReactionClearEmojiEvent):
         try:
-            await stars.handle_reaction_clear(payload.guild_id, payload.message_id, payload.emoji)
+            await stars.handle_reaction_clear(self, payload.guild_id, payload.message_id, payload.emoji)
         except Exception:
             logger.exception("별 기록 중 오류")
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        try:
+            await stars.handle_message_delete(payload, self)
+        except Exception:
+            logger.exception("스타보드 글 정리 중 오류")
 
     async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent):
         try:
