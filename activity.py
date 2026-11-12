@@ -37,11 +37,14 @@ KST = timezone(timedelta(hours=9))
 XP_COOLDOWN_SECONDS = 60  # 같은 사람은 이 시간(초)에 한 번만 경험치/코인 지급 (도배 방지)
 XP_MIN, XP_MAX = 15, 40  # 채팅 1회 지급 경험치
 REACTION_XP = 25  # 반응(이모지)을 단 사람에게 주는 경험치
-REACTION_COOLDOWN_SECONDS = 300  # 반응 경험치는 5분에 한 번
+REACTION_COIN = 1  # 반응(이모지)을 단 사람에게 주는 코인
+REACTION_COOLDOWN_SECONDS = 300  # 반응 경험치 · 코인은 5분에 한 번
+WORK_MEDIA_XP_BONUS = 50  # 작업물 채널에 사진·영상을 올리면 주는 경험치 보너스 (코인은 없음)
+WORK_MEDIA_COOLDOWN_SECONDS = 300  # 작업물 보너스는 5분에 한 번 (여러 장 연속 업로드로 부풀리기 방지)
 LEVEL_BASE, LEVEL_STEP = 75, 100  # 레벨 L → L+1 필요 경험치 = LEVEL_STEP × L + LEVEL_BASE
-COIN_BASE = 1  # 1회 지급 기본 코인
+# 코인은 작품을 신청하는 쪽(채팅 · 반응 위주 활동)이 주로 쓰므로 채팅 · 반응으로 지급합니다. 사진 보너스는 없음.
+COIN_BASE = 1  # 채팅 1회 지급 기본 코인
 COIN_LENGTH_BONUS = ((150, 2), (50, 1))  # (최소 글자 수, 보너스) — 긴 글 보너스 (큰 값부터)
-COIN_MEDIA_BONUS = 2  # 사진·영상 첨부 보너스
 CURRENCY_NAME = "코인"
 CURRENCY_EMOJI = "🪙"
 
@@ -56,6 +59,7 @@ DEFAULT_SETTINGS = {
     "excluded_channels": [],  # 활동량을 세지 않을 채널 (스레드는 상위 채널 기준)
     "level_roles": {},  # "레벨" -> 역할 ID
     "badge_roles": [],  # /랭크 카드에 뱃지로 보여 줄 역할 ID (등록 순서대로 표시)
+    "work_channels": [],  # 작업물 채널 — 사진·영상을 올리면 경험치 보너스 (스레드는 상위 채널 기준)
 }
 
 
@@ -85,14 +89,12 @@ def level_progress(xp: int) -> tuple[int, int, int]:
     return level, xp - total_xp_for_level(level), xp_to_next(level)
 
 
-def coins_for_message(length: int, has_media: bool) -> int:
+def coins_for_message(length: int) -> int:
     coins = COIN_BASE
     for min_len, bonus in COIN_LENGTH_BONUS:
         if length >= min_len:
             coins += bonus
             break
-    if has_media:
-        coins += COIN_MEDIA_BONUS
     return coins
 
 
@@ -255,18 +257,18 @@ class ActivityDB:
         self.conn.commit()
         return old
 
-    def add_xp(self, guild_id: int, user_id: int, amount: int) -> tuple[int, int]:
-        """경험치만 더하고 (이전 경험치, 새 경험치)를 반환합니다. (반응 경험치, Arcane 가져오기용)"""
+    def add_xp(self, guild_id: int, user_id: int, amount: int, coins: int = 0) -> tuple[int, int]:
+        """경험치(와 코인)를 더하고 (이전 경험치, 새 경험치)를 반환합니다. (반응 보상, Arcane 가져오기용)"""
         old = self.get_member(guild_id, user_id)["xp"]
         self.conn.execute(
-            "INSERT INTO members (guild_id, user_id, xp) VALUES (?, ?, ?) "
-            "ON CONFLICT(guild_id, user_id) DO UPDATE SET xp = xp + excluded.xp",
-            (guild_id, user_id, amount),
+            "INSERT INTO members (guild_id, user_id, xp, coins) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET xp = xp + excluded.xp, coins = coins + excluded.coins",
+            (guild_id, user_id, amount, coins),
         )
         self.conn.execute(
-            "INSERT INTO daily (guild_id, user_id, day, xp) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(guild_id, user_id, day) DO UPDATE SET xp = xp + excluded.xp",
-            (guild_id, user_id, today_kst(), amount),
+            "INSERT INTO daily (guild_id, user_id, day, xp, coins) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id, day) DO UPDATE SET xp = xp + excluded.xp, coins = coins + excluded.coins",
+            (guild_id, user_id, today_kst(), amount, coins),
         )
         self.conn.commit()
         return old, old + amount
@@ -306,11 +308,17 @@ def _is_media(attachment: discord.Attachment) -> bool:
     return ext in MEDIA_EXTENSIONS
 
 
+def _in_channels(channel, channel_ids) -> bool:
+    """채널(또는 그 채널 안의 스레드 · 포스트)이 목록에 있는지"""
+    ids = set(channel_ids or [])
+    return bool(ids) and (channel.id in ids or getattr(channel, "parent_id", None) in ids)
+
+
 def _is_excluded(channel, settings: dict) -> bool:
-    excluded = set(settings.get("excluded_channels", []))
-    if not excluded:
-        return False
-    return channel.id in excluded or getattr(channel, "parent_id", None) in excluded
+    return _in_channels(channel, settings.get("excluded_channels"))
+
+
+_last_work_bonus: dict[tuple[int, int], float] = {}
 
 
 async def handle_message(message: discord.Message) -> None:
@@ -338,13 +346,19 @@ async def handle_message(message: discord.Message) -> None:
     if awarded:
         _last_award[key] = now
         xp_gain = random.randint(XP_MIN, XP_MAX)
-        coin_gain = coins_for_message(length, has_media)
+        coin_gain = coins_for_message(length)
+
+    # 작업물 채널에 사진·영상을 올리면 경험치 보너스 (채팅 쿨다운과 별개로 5분에 한 번)
+    if has_media and _in_channels(message.channel, settings.get("work_channels")):
+        if now - _last_work_bonus.get(key, -1e9) >= WORK_MEDIA_COOLDOWN_SECONDS:
+            _last_work_bonus[key] = now
+            xp_gain += WORK_MEDIA_XP_BONUS
 
     old_xp, new_xp = database.record_message(
         guild_id, message.author.id, length, has_media, xp_gain, coin_gain
     )
 
-    if awarded and settings.get("live"):
+    if xp_gain and settings.get("live"):
         old_level, new_level = level_from_xp(old_xp), level_from_xp(new_xp)
         if new_level > old_level:
             await _on_level_up(message.channel, message.author, new_level, settings)
@@ -354,7 +368,7 @@ _last_reaction_award: dict[tuple[int, int], float] = {}
 
 
 async def handle_reaction(payload: discord.RawReactionActionEvent, client: discord.Client) -> None:
-    """반응(이모지)을 단 사람에게 5분에 한 번 경험치를 줍니다 (Arcane 'Reactor' 설정과 동일, 코인은 없음)."""
+    """반응(이모지)을 단 사람에게 5분에 한 번 경험치(Arcane 'Reactor' 설정과 동일)와 코인을 줍니다."""
     member = payload.member
     if payload.guild_id is None or member is None or member.bot:
         return
@@ -370,7 +384,7 @@ async def handle_reaction(payload: discord.RawReactionActionEvent, client: disco
         return
     _last_reaction_award[key] = now
 
-    old_xp, new_xp = database.add_xp(payload.guild_id, member.id, REACTION_XP)
+    old_xp, new_xp = database.add_xp(payload.guild_id, member.id, REACTION_XP, coins=REACTION_COIN)
     if settings.get("live") and level_from_xp(new_xp) > level_from_xp(old_xp) and channel is not None:
         await _on_level_up(channel, member, level_from_xp(new_xp), settings)
 
@@ -728,6 +742,33 @@ def register(tree: app_commands.CommandTree) -> None:
             f"✅ {채널.mention} 채널을 다시 활동량에 포함합니다.", ephemeral=True
         )
 
+    @admin.command(name="작업물채널추가", description="작업물 채널을 추가합니다. 여기에 사진·영상을 올리면 경험치 보너스를 줍니다.")
+    async def add_work_channel(interaction: discord.Interaction, 채널: discord.abc.GuildChannel):
+        database = get_db()
+        s = database.get_settings(interaction.guild_id)
+        work = s.setdefault("work_channels", [])
+        if 채널.id not in work:
+            work.append(채널.id)
+            database.save_settings(interaction.guild_id, s)
+        await interaction.response.send_message(
+            f"✅ {채널.mention} 채널(안의 포스트 · 스레드 포함)을 작업물 채널로 정했습니다. "
+            f"사진·영상을 올리면 {WORK_MEDIA_COOLDOWN_SECONDS // 60}분에 한 번 경험치 +{WORK_MEDIA_XP_BONUS} 보너스를 줍니다.",
+            ephemeral=True,
+        )
+
+    @admin.command(name="작업물채널제거", description="작업물 채널 목록에서 채널을 뺍니다.")
+    async def remove_work_channel(interaction: discord.Interaction, 채널: discord.abc.GuildChannel):
+        database = get_db()
+        s = database.get_settings(interaction.guild_id)
+        work = s.setdefault("work_channels", [])
+        if 채널.id in work:
+            work.remove(채널.id)
+            database.save_settings(interaction.guild_id, s)
+            text = f"🗑️ {채널.mention} 채널을 작업물 채널에서 뺐습니다."
+        else:
+            text = f"ℹ️ {채널.mention} 채널은 작업물 채널이 아닙니다."
+        await interaction.response.send_message(text, ephemeral=True)
+
     @admin.command(name="레벨역할추가", description="특정 레벨에 도달하면 줄 역할을 정합니다.")
     @app_commands.describe(레벨="역할을 줄 레벨 (예: 10)", 역할="그 레벨에 줄 역할")
     async def add_level_role(
@@ -792,6 +833,7 @@ def register(tree: app_commands.CommandTree) -> None:
         live = "🟢 켜짐" if s.get("live") else "⚪ 꺼짐 (경험치·코인은 적립 중)"
         announce = f"<#{s['announce_channel_id']}>" if s.get("announce_channel_id") else "채팅한 채널"
         excluded = ", ".join(f"<#{c}>" for c in s.get("excluded_channels", [])) or "없음"
+        work = ", ".join(f"<#{c}>" for c in s.get("work_channels", [])) or "없음"
         roles = sorted(((int(k), v) for k, v in s.get("level_roles", {}).items()))
         role_text = "\n".join(f"  - 레벨 {lv}: <@&{rid}>" for lv, rid in roles) or "  - 없음"
         bonus = ", ".join(f"{n}자 이상 +{b}" for n, b in sorted(COIN_LENGTH_BONUS))
@@ -800,12 +842,14 @@ def register(tree: app_commands.CommandTree) -> None:
             f"- **레벨업 알림 · 역할 지급**: {live}\n"
             f"- **레벨업 알림 채널**: {announce}\n"
             f"- **활동량 제외 채널**: {excluded}\n"
+            f"- **작업물 채널** (사진·영상 경험치 보너스): {work}\n"
             f"- **레벨 역할**:\n{role_text}\n"
             f"- **뱃지 역할** (`/랭크` 카드에 표시): "
             f"{', '.join(f'<@&{r}>' for r in s.get('badge_roles', [])) or '없음'}\n"
-            f"- **지급 규칙**: 채팅은 {XP_COOLDOWN_SECONDS}초에 한 번 경험치 {XP_MIN}~{XP_MAX} + "
-            f"{CURRENCY_NAME} {COIN_BASE}개 (긴 글: {bonus}, 사진·영상 +{COIN_MEDIA_BONUS}) / "
-            f"반응은 {REACTION_COOLDOWN_SECONDS // 60}분에 한 번 경험치 {REACTION_XP}\n"
+            f"- **지급 규칙**:\n"
+            f"  - 채팅: {XP_COOLDOWN_SECONDS}초에 한 번 경험치 {XP_MIN}~{XP_MAX} + {CURRENCY_NAME} {COIN_BASE}개 (긴 글: {bonus})\n"
+            f"  - 반응: {REACTION_COOLDOWN_SECONDS // 60}분에 한 번 경험치 {REACTION_XP} + {CURRENCY_NAME} {REACTION_COIN}개\n"
+            f"  - 작업물 채널 사진·영상: {WORK_MEDIA_COOLDOWN_SECONDS // 60}분에 한 번 경험치 +{WORK_MEDIA_XP_BONUS} ({CURRENCY_NAME} 없음)\n"
             f"- **Arcane 기록 가져오기**: {'완료 (' + str(len(s.get('arcane_imported', []))) + '명)' if s.get('arcane_imported') else '아직 안 함'}"
         )
         await interaction.response.send_message(msg, ephemeral=True)
