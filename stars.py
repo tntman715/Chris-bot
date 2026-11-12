@@ -572,6 +572,8 @@ async def _apply_carl_stats(message: discord.Message, stats: tuple[Optional[int]
         uid = member.id if member else None
     if uid is None:
         return None
+    # 칼봇 숫자가 크리스봇이 직접 센 것보다 적으면 크리스봇 숫자를 유지합니다 (올리기만 함, 주인 결정 2026-11-12)
+    total = max(total, counted_stars(message.guild.id, uid)[0])
     before = set_total(message.guild.id, uid, total)
     try:
         await message.add_reaction("✅")
