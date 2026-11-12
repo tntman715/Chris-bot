@@ -97,6 +97,58 @@ def format_score(val: float) -> str:
     return f"{val:.6f}".rstrip("0").rstrip(".")
 
 
+# 디스코드 메시지는 한 번에 2,000자까지만 보낼 수 있으므로 여유를 두고 1,900자 단위로 나눕니다.
+MESSAGE_CHUNK_LIMIT = 1900
+
+
+def split_message(text: str, limit: int = MESSAGE_CHUNK_LIMIT) -> list[str]:
+    """
+    긴 메시지를 줄 단위로 limit 이하 조각들로 나눕니다.
+    ``` 코드블록 중간에서 잘리면 앞 조각에서 코드블록을 닫고 다음 조각에서 다시 엽니다.
+    """
+    lines: list[str] = []
+    for line in text.split("\n"):
+        # 한 줄이 너무 길면 강제로 자릅니다.
+        while len(line) > limit - 20:
+            lines.append(line[: limit - 20])
+            line = line[limit - 20 :]
+        lines.append(line)
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    open_fence: Optional[str] = None  # 현재 열려 있는 코드블록의 여는 줄 (예: "```text")
+
+    for line in lines:
+        # 이 줄을 넣고, 코드블록이 열린 상태라면 닫는 ``` 까지 넣을 공간이 있어야 합니다.
+        reserve = 4 if open_fence else 0
+        if current and current_len + len(line) + 1 + reserve > limit:
+            if open_fence:
+                current.append("```")
+            chunks.append("\n".join(current))
+            current = [open_fence] if open_fence else []
+            current_len = len(open_fence) + 1 if open_fence else 0
+
+        current.append(line)
+        current_len += len(line) + 1
+
+        if line.strip().startswith("```"):
+            open_fence = None if open_fence else line.strip()
+
+    if current and "\n".join(current).strip():
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+async def send_long_ephemeral(interaction: discord.Interaction, text: str) -> None:
+    """본인에게만 보이는(ephemeral) 메시지를 2,000자 제한에 맞게 나누어 보냅니다."""
+    for chunk in split_message(text):
+        if not interaction.response.is_done():
+            await interaction.response.send_message(chunk, ephemeral=True)
+        else:
+            await interaction.followup.send(chunk, ephemeral=True)
+
+
 async def send_archive_log(
     guild: Optional[discord.Guild], archive_channel_id: Optional[int], text: str
 ) -> bool:
@@ -118,23 +170,9 @@ async def send_archive_log(
         return False
 
     try:
-        lines = text.split("\n")
-        chunk = []
-        current_len = 0
-        for line in lines:
-            if current_len + len(line) + 1 > 1900 and chunk:
-                await channel.send(
-                    "\n".join(chunk),
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                chunk = [line]
-                current_len = len(line) + 1
-            else:
-                chunk.append(line)
-                current_len += len(line) + 1
-        if chunk:
+        for chunk in split_message(text):
             await channel.send(
-                "\n".join(chunk),
+                chunk,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         return True
@@ -557,9 +595,11 @@ class ApproveSeasonView(discord.ui.View):
                 + "\n*(서버 설정 → 역할에서 `Chris Bot` 역할을 등급 역할들보다 위로 올리고 `역할 관리` 권한을 켜주세요.)*"
             )
 
-        await interaction.edit_original_response(
-            content="\n".join(msg_parts), view=None
-        )
+        # 대상자가 많아도 공지 문구가 잘리지 않도록 2,000자 제한에 맞춰 나누어 보냅니다.
+        chunks = split_message("\n".join(msg_parts))
+        await interaction.edit_original_response(content=chunks[0], view=None)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk, ephemeral=True)
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
     async def cancel_approve(
@@ -811,9 +851,9 @@ async def list_allowed_channels(interaction: discord.Interaction):
         return
 
     lines = [f"- <#{cid}> (`{cid}`)" for cid in allowed]
-    await interaction.response.send_message(
+    await send_long_ephemeral(
+        interaction,
         "📋 **포스트 작성자 직접 삭제가 허용된 채널 목록:**\n" + "\n".join(lines),
-        ephemeral=True,
     )
 
 
@@ -1439,7 +1479,7 @@ async def list_grade_settings(interaction: discord.Interaction):
         f"**3. 심사위원 역할 및 투표 상한선**:\n{eval_text}\n\n"
         f"**4. 등록된 기본 등급 목록 (낮은 점수순)**:\n{grade_text}"
     )
-    await interaction.response.send_message(msg, ephemeral=True)
+    await send_long_ephemeral(interaction, msg)
 
 
 @grade_admin_group.command(
@@ -1580,7 +1620,7 @@ async def view_aggregation_status(
             + f"\n- **산술평균 점수**: `{avg_str}`\n"
             f"- **취합 결정 등급**: {final_str}"
         )
-        await interaction.response.send_message(msg, ephemeral=True)
+        await send_long_ephemeral(interaction, msg)
         return
 
     summary_lines = []
@@ -1633,7 +1673,7 @@ async def view_aggregation_status(
         + "\n\n".join(preview_lines)
         + "\n```"
     )
-    await interaction.response.send_message(msg, ephemeral=True)
+    await send_long_ephemeral(interaction, msg)
 
 
 @grade_admin_group.command(
