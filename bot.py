@@ -437,19 +437,29 @@ class ApproveSeasonView(discord.ui.View):
                 roles_to_remove = [
                     r for r in existing_grade_roles if r.id != new_role_id
                 ]
+                linked_eval_rid = final_grade.get("linked_evaluator_role_id")
+                linked_eval_role = (
+                    guild.get_role(int(linked_eval_rid)) if linked_eval_rid else None
+                )
                 try:
                     if roles_to_remove:
                         await member.remove_roles(
                             *roles_to_remove,
                             reason="등급 조정 시즌 최종 승인 (기존 등급 제거)",
                         )
+                    roles_to_add = []
                     if new_role and new_role not in member.roles:
+                        roles_to_add.append(new_role)
+                    if linked_eval_role and linked_eval_role not in member.roles:
+                        roles_to_add.append(linked_eval_role)
+                    if roles_to_add:
                         await member.add_roles(
-                            new_role, reason="등급 조정 시즌 최종 승인 (새 등급 부여)"
+                            *roles_to_add,
+                            reason="등급 조정 시즌 최종 승인 (새 등급 및 연동 심사역할 부여)",
                         )
                 except discord.Forbidden:
                     role_errors.append(
-                        f"- {member.mention}: 봇에게 `역할 관리` 권한이 없거나 봇의 역할 순서가 등급 역할보다 낮아 변경 실패"
+                        f"- {member.mention}: 봇에게 `역할 관리` 권한이 없거나 봇의 역할 순서가 대상 역할보다 낮아 변경 실패"
                     )
                 except discord.HTTPException as e:
                     role_errors.append(f"- {member.mention}: 역할 변경 중 오류 ({e})")
@@ -560,6 +570,100 @@ class ApproveSeasonView(discord.ui.View):
         await interaction.response.edit_message(
             content="✅ 최종 승인을 취소했습니다. (아직 수정하거나 평가를 더 받을 수 있습니다.)",
             view=None,
+        )
+
+
+# =====================================================================
+# 3. 일반 사용자 자진 등급 박탈 UI
+# =====================================================================
+class SelfStripGradeView(discord.ui.View):
+    """일반 유저가 본인의 등급 역할만 자진 박탈(반납)할 때 확인하는 뷰 (심사역할은 유지)"""
+
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=60.0)
+        self.requester_id = requester_id
+
+    @discord.ui.button(
+        label="등급 박탈 확인", style=discord.ButtonStyle.danger, emoji="⚠️"
+    )
+    async def confirm_strip(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "❌ 본인만 누를 수 있는 버튼입니다.", ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            return
+
+        config = load_config()
+        g = get_guild_data(config, guild.id)
+        gs = g["grade_system"]
+        grades = gs.get("grades", {})
+        archive_channel_id = gs.get("archive_channel_id")
+
+        # 등록된 등급 역할 ID만 추출 (심사위원 역할은 절대 제거 대상에 포함하지 않음)
+        grade_role_ids = {
+            int(info["role_id"])
+            for info in grades.values()
+            if info.get("role_id")
+        }
+        roles_to_strip = [r for r in member.roles if r.id in grade_role_ids]
+
+        if not roles_to_strip:
+            await interaction.response.edit_message(
+                content="ℹ️ 현재 보유하고 계신 등급 역할이 없습니다.", view=None
+            )
+            return
+
+        stripped_names = ", ".join(f"`{r.name}`" for r in roles_to_strip)
+        try:
+            await member.remove_roles(
+                *roles_to_strip,
+                reason=f"본인({member})의 /등급박탈 요청에 의한 자진 등급 박탈 (심사역할 유지)",
+            )
+        except discord.Forbidden:
+            await interaction.response.edit_message(
+                content=(
+                    "❌ 봇에게 **역할 관리(Manage Roles)** 권한이 없거나 봇의 역할 순서가 등급 역할보다 낮아 해제하지 못했습니다.\n"
+                    "서버 관리자에게 문의해 주세요."
+                ),
+                view=None,
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.response.edit_message(
+                content=f"❌ 등급 해제 중 오류가 발생했습니다: {e}", view=None
+            )
+            return
+
+        await interaction.response.edit_message(
+            content=(
+                f"✅ 본인의 등급 역할({stripped_names})이 박탈(반납) 처리되었습니다.\n"
+                "*(보유하고 계신 심사위원 역할은 그대로 유지됩니다.)*"
+            ),
+            view=None,
+        )
+
+        if archive_channel_id:
+            await send_archive_log(
+                guild,
+                archive_channel_id,
+                f"🏳️ **[자진 등급 박탈]** {member.mention}(`@{member.name}`)님이 본인의 등급 역할({stripped_names})을 스스로 박탈했습니다. *(심사위원 역할 유지)*",
+            )
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel_strip(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if interaction.user.id != self.requester_id:
+            return
+        await interaction.response.edit_message(
+            content="✅ 등급 박탈을 취소했습니다.", view=None
         )
 
 
@@ -958,6 +1062,43 @@ async def submit_grade_evaluation(
         await send_archive_log(interaction.guild, archive_channel_id, archive_msg)
 
 
+@bot.tree.command(
+    name="등급박탈",
+    description="본인이 현재 보유하고 있는 등급 역할을 스스로 박탈(반납)합니다. (받은 심사위원 역할은 유지됨)",
+)
+@app_commands.guild_only()
+async def strip_my_grade(interaction: discord.Interaction):
+    member = interaction.user
+    if not isinstance(member, discord.Member) or interaction.guild_id is None:
+        return
+
+    config = load_config()
+    g = get_guild_data(config, interaction.guild_id)
+    grades = g["grade_system"].get("grades", {})
+
+    grade_role_ids = {
+        int(info["role_id"]) for info in grades.values() if info.get("role_id")
+    }
+    my_grade_roles = [r for r in member.roles if r.id in grade_role_ids]
+
+    if not my_grade_roles:
+        await interaction.response.send_message(
+            "ℹ️ 현재 보유하고 계신 등급 역할이 없습니다.",
+            ephemeral=True,
+        )
+        return
+
+    roles_mention = ", ".join(r.mention for r in my_grade_roles)
+    view = SelfStripGradeView(requester_id=member.id)
+    await interaction.response.send_message(
+        f"⚠️ **정말 본인의 현재 등급({roles_mention})을 스스로 박탈(반납)하시겠습니까?**\n"
+        "- `[⚠️ 등급 박탈 확인]`을 누르면 보유 중인 등급 역할만 제거됩니다.\n"
+        "- *(이미 부여받으신 심사위원 역할은 해제되지 않고 그대로 유지됩니다.)*",
+        view=view,
+        ephemeral=True,
+    )
+
+
 # =====================================================================
 # 명령어 3: /등급관리 (관리자용 설정 · 취합 · 수정 · 최종승인 그룹)
 # =====================================================================
@@ -971,18 +1112,20 @@ grade_admin_group = app_commands.Group(
 
 @grade_admin_group.command(
     name="등급등록",
-    description="기본 등급 기호와 점수, 연결할 디스코드 역할을 등록합니다. (예: 기호=C, 점수=2, 역할=@[C] Good Creator)",
+    description="기본 등급 기호와 점수, 연결할 역할(및 달성 시 동시 부여할 심사역할)을 등록합니다.",
 )
 @app_commands.describe(
     등급기호="기본 등급 기호 (예: N, D, C, B, A, S)",
     점수="산술평균 계산에 사용할 기본 숫자 점수 (예: 1, 2, 3...)",
     역할="해당 등급에 부여할 디스코드 역할(Role)",
+    동시부여심사역할="(선택) 이 등급을 받게 될 때 동시에 자동으로 부여할 심사위원 역할",
 )
 async def register_grade(
     interaction: discord.Interaction,
     등급기호: str,
     점수: float,
     역할: discord.Role,
+    동시부여심사역할: Optional[discord.Role] = None,
 ):
     code = 등급기호.strip().upper()
     if "+" in code or "-" in code:
@@ -996,20 +1139,73 @@ async def register_grade(
     g = get_guild_data(config, interaction.guild_id)
     grades = g["grade_system"]["grades"]
 
+    prev_linked = grades.get(code, {}).get("linked_evaluator_role_id")
+    linked_eval_id = (
+        동시부여심사역할.id if 동시부여심사역할 is not None else prev_linked
+    )
+
     grades[code] = {
         "code": code,
         "value": float(점수),
         "role_id": 역할.id,
         "role_name": 역할.name,
+        "linked_evaluator_role_id": linked_eval_id,
     }
     save_config(config)
 
     val_str = format_score(점수)
+    eval_line = (
+        f"\n- **동시 부여 심사역할**: <@&{linked_eval_id}>"
+        if linked_eval_id
+        else ""
+    )
     await interaction.response.send_message(
-        f"✅ 기본 등급이 등록되었습니다: **`{code}` = {val_str}점** (연결된 역할: {역할.mention} / 표시명: `{역할.name}`)\n"
+        f"✅ 기본 등급이 등록되었습니다: **`{code}` = {val_str}점** (연결된 역할: {역할.mention} / 표시명: `{역할.name}`){eval_line}\n"
         f"*(이제 평가 시 `{code}+`, `{code}++`, `{code}-`, `{code}--` 등의 점근 점수도 자동으로 사용할 수 있습니다.)*",
         ephemeral=True,
     )
+
+
+@grade_admin_group.command(
+    name="등급심사연결",
+    description="특정 등급을 달성했을 때 동시에 부여할 심사위원 역할을 설정(또는 해제)합니다.",
+)
+@app_commands.describe(
+    등급기호="설정할 기본 등급 기호 (예: B, A)",
+    심사역할="이 등급 달성 시 동시에 부여할 심사위원 역할 (비워두면 동시 부여 해제)",
+)
+@app_commands.autocomplete(등급기호=base_grade_autocomplete)
+async def link_grade_evaluator_role(
+    interaction: discord.Interaction,
+    등급기호: str,
+    심사역할: Optional[discord.Role] = None,
+):
+    code = 등급기호.strip().upper()
+    config = load_config()
+    g = get_guild_data(config, interaction.guild_id)
+    grades = g["grade_system"]["grades"]
+
+    if code not in grades:
+        await interaction.response.send_message(
+            f"❌ `{code}` 등급은 등록되어 있지 않습니다. 먼저 `/등급관리 등급등록`으로 등록해 주세요.",
+            ephemeral=True,
+        )
+        return
+
+    if 심사역할 is None:
+        grades[code]["linked_evaluator_role_id"] = None
+        save_config(config)
+        await interaction.response.send_message(
+            f"ℹ️ **`{code}`** 등급의 동시 부여 심사역할 설정을 해제했습니다.",
+            ephemeral=True,
+        )
+    else:
+        grades[code]["linked_evaluator_role_id"] = 심사역할.id
+        save_config(config)
+        await interaction.response.send_message(
+            f"✅ 이제 **`{code}`** (`{grades[code]['role_name']}`) 등급을 받게 되면 {심사역할.mention} 심사역할도 동시에 부여됩니다!",
+            ephemeral=True,
+        )
 
 
 @grade_admin_group.command(
@@ -1192,8 +1388,14 @@ async def list_grade_settings(interaction: discord.Interaction):
             p_minus = parse_grade_expression(f"{c}-", grades)
             plus_str = format_score(p_plus["value"]) if p_plus else ""
             minus_str = format_score(p_minus["value"]) if p_minus else ""
+            linked_eval = info.get("linked_evaluator_role_id")
+            linked_str = (
+                f" *(🎖️ 달성 시 심사역할 동시 부여: <@&{linked_eval}>)*"
+                if linked_eval
+                else ""
+            )
             grade_lines.append(
-                f"- **`{c}`** = `{v_str}점` (`{c}-`: {minus_str} / `{c}+`: {plus_str}) ➡️ <@&{info['role_id']}> (`{info['role_name']}`)"
+                f"- **`{c}`** = `{v_str}점` (`{c}-`: {minus_str} / `{c}+`: {plus_str}) ➡️ <@&{info['role_id']}> (`{info['role_name']}`){linked_str}"
             )
         grade_text = "\n".join(grade_lines)
     else:
