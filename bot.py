@@ -1003,6 +1003,14 @@ async def submit_grade_evaluation(
     if not isinstance(user, discord.Member):
         return
 
+    # 자기 자신에게는 투표할 수 없음 (관리자 포함)
+    if 대상.id == user.id:
+        await interaction.response.send_message(
+            "❌ 본인에게는 등급 평가를 제출할 수 없습니다.",
+            ephemeral=True,
+        )
+        return
+
     can_vote, max_allowed_score, limit_label = get_member_voting_limit(user, gs)
     if not can_vote:
         await interaction.response.send_message(
