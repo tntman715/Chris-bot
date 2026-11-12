@@ -72,6 +72,16 @@ def ensure_tables() -> None:
             by_carl INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_star_board_post ON star_board (board_message_id);
+        -- 누가 누구에게 별을 줬는지 (본인 · 봇 제외). /스타정보 · 준 별 순위용
+        CREATE TABLE IF NOT EXISTS star_givers (
+            message_id INTEGER NOT NULL,
+            giver_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            author_id INTEGER NOT NULL,
+            PRIMARY KEY (message_id, giver_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_star_givers_giver ON star_givers (guild_id, giver_id);
+        CREATE INDEX IF NOT EXISTS idx_star_givers_author ON star_givers (guild_id, author_id);
         """
     )
     _conn().commit()
@@ -184,6 +194,89 @@ def count_starred_works(guild_id: int) -> int:
     return _conn().execute(
         "SELECT COUNT(*) FROM star_messages WHERE guild_id = ? AND stars > 0", (guild_id,)
     ).fetchone()[0]
+
+
+def add_giver(guild_id: int, message_id: int, giver_id: int, author_id: int) -> None:
+    _conn().execute(
+        "INSERT OR IGNORE INTO star_givers (message_id, giver_id, guild_id, author_id) VALUES (?, ?, ?, ?)",
+        (message_id, giver_id, guild_id, author_id),
+    )
+    _conn().commit()
+
+
+def remove_giver(message_id: int, giver_id: Optional[int] = None) -> None:
+    """giver_id 가 None 이면 그 메시지의 기록을 모두 지움 (반응 전체 삭제)"""
+    if giver_id is None:
+        _conn().execute("DELETE FROM star_givers WHERE message_id = ?", (message_id,))
+    else:
+        _conn().execute("DELETE FROM star_givers WHERE message_id = ? AND giver_id = ?", (message_id, giver_id))
+    _conn().commit()
+
+
+def replace_givers(guild_id: int, message_id: int, author_id: int, giver_ids: list[int]) -> None:
+    conn = _conn()
+    conn.execute("DELETE FROM star_givers WHERE message_id = ?", (message_id,))
+    conn.executemany(
+        "INSERT OR IGNORE INTO star_givers (message_id, giver_id, guild_id, author_id) VALUES (?, ?, ?, ?)",
+        [(message_id, g, guild_id, author_id) for g in giver_ids if g != author_id],
+    )
+    conn.commit()
+
+
+def stars_given(guild_id: int, user_id: int) -> int:
+    return _conn().execute(
+        "SELECT COUNT(*) FROM star_givers WHERE guild_id = ? AND giver_id = ?", (guild_id, user_id)
+    ).fetchone()[0]
+
+
+def top_givers(guild_id: int, limit: int = PAGE_SIZE, offset: int = 0) -> list[tuple[int, int, int]]:
+    """[(유저 ID, 준 별, 별을 준 사람 수)] 별을 많이 준 순"""
+    return _conn().execute(
+        "SELECT giver_id, COUNT(*) AS n, COUNT(DISTINCT author_id) FROM star_givers WHERE guild_id = ? "
+        "GROUP BY giver_id ORDER BY n DESC, giver_id LIMIT ? OFFSET ?",
+        (guild_id, limit, offset),
+    ).fetchall()
+
+
+def count_givers(guild_id: int) -> int:
+    return _conn().execute(
+        "SELECT COUNT(DISTINCT giver_id) FROM star_givers WHERE guild_id = ?", (guild_id,)
+    ).fetchone()[0]
+
+
+def giver_rank(guild_id: int, given: int) -> int:
+    return _conn().execute(
+        "SELECT COUNT(*) FROM (SELECT COUNT(*) AS n FROM star_givers WHERE guild_id = ? GROUP BY giver_id) WHERE n > ?",
+        (guild_id, given),
+    ).fetchone()[0] + 1
+
+
+def fans_of(guild_id: int, user_id: int, limit: int = 3) -> list[tuple[int, int]]:
+    """나에게 별을 가장 많이 준 사람 [(유저 ID, 별)]"""
+    return _conn().execute(
+        "SELECT giver_id, COUNT(*) AS n FROM star_givers WHERE guild_id = ? AND author_id = ? "
+        "GROUP BY giver_id ORDER BY n DESC, giver_id LIMIT ?",
+        (guild_id, user_id, limit),
+    ).fetchall()
+
+
+def favorites_of(guild_id: int, user_id: int, limit: int = 3) -> list[tuple[int, int]]:
+    """내가 별을 가장 많이 준 사람 [(유저 ID, 별)]"""
+    return _conn().execute(
+        "SELECT author_id, COUNT(*) AS n FROM star_givers WHERE guild_id = ? AND giver_id = ? "
+        "GROUP BY author_id ORDER BY n DESC, author_id LIMIT ?",
+        (guild_id, user_id, limit),
+    ).fetchall()
+
+
+def top_works_of(guild_id: int, user_id: int, limit: int = 3) -> list[tuple[int, int, int, int, Optional[int]]]:
+    """그 사람의 별 많이 받은 작품 [(메시지 ID, 채널 ID, 작성자 ID, 별, 스타보드 글 ID)]"""
+    return _conn().execute(
+        "SELECT m.message_id, m.channel_id, m.author_id, m.stars, b.board_message_id FROM star_messages m "
+        "LEFT JOIN star_board b ON b.message_id = m.message_id "
+        "WHERE m.guild_id = ? AND m.author_id = ? AND m.stars > 0 ORDER BY m.stars DESC, m.message_id LIMIT ?",
+        (guild_id, user_id, limit),
+    ).fetchall()
 
 
 def replace_guild_stars(guild_id: int, rows: dict[int, tuple[int, int, int]], carl_posts: dict[int, int]) -> None:
@@ -465,6 +558,7 @@ async def handle_reaction_add(payload: discord.RawReactionActionEvent, client: d
     if author_id is None or payload.user_id == author_id:  # 본인 별은 세지 않음
         return
     change_stars(payload.guild_id, payload.channel_id, payload.message_id, author_id, +1)
+    add_giver(payload.guild_id, payload.message_id, payload.user_id, author_id)
     guild = client.get_guild(payload.guild_id)
     if guild:
         await sync_board(guild, payload.message_id)
@@ -480,6 +574,7 @@ async def handle_reaction_remove(payload: discord.RawReactionActionEvent, client
     if row is None or payload.user_id == row["author_id"] or payload.user_id == getattr(client.user, "id", None):
         return
     change_stars(payload.guild_id, payload.channel_id, payload.message_id, None, -1)
+    remove_giver(payload.message_id, payload.user_id)
     guild = client.get_guild(payload.guild_id)
     if guild:
         await sync_board(guild, payload.message_id)
@@ -492,6 +587,7 @@ async def handle_reaction_clear(client: discord.Client, guild_id: Optional[int],
     row = get_message(message_id)
     if row:
         set_message_stars(row["guild_id"], row["channel_id"], message_id, row["author_id"], 0)
+        remove_giver(message_id)
         guild = client.get_guild(guild_id)
         if guild:
             await sync_board(guild, message_id)
@@ -674,9 +770,81 @@ async def import_stars(guild: discord.Guild, board: discord.TextChannel, progres
     }
 
 
+async def fetch_star_givers(http, channel_id: int, message_id: int) -> Optional[list[dict]]:
+    """메시지에 ⭐을 단 사람 전체 (100명씩). 메시지나 채널이 없으면 None."""
+    users: list[dict] = []
+    after = None
+    while True:
+        try:
+            page = await http.get_reaction_users(channel_id, message_id, STAR, 100, after=after)
+        except (discord.NotFound, discord.Forbidden):
+            return None
+        users += page
+        if len(page) < 100:
+            return users
+        after = int(page[-1]["id"])
+
+
+async def import_givers(guild: discord.Guild, http, progress) -> dict:
+    """
+    별 받은 메시지마다 ⭐을 단 사람 목록을 읽어 '누가 누구에게 줬는지'를 기록합니다.
+    디스코드 제한(1초에 1번) 때문에 메시지 3천 개면 약 1시간. 원본이 지워진 메시지는 건너뜀.
+    """
+    rows = _conn().execute(
+        "SELECT message_id, channel_id, author_id FROM star_messages WHERE guild_id = ? AND stars > 0 ORDER BY message_id",
+        (guild.id,),
+    ).fetchall()
+    done = missing = given = 0
+    for i, (mid, cid, author) in enumerate(rows, 1):
+        users = await fetch_star_givers(http, cid, mid)
+        if users is None:
+            missing += 1
+        else:
+            ids = [int(u["id"]) for u in users if not u.get("bot") and int(u["id"]) != author]
+            replace_givers(guild.id, mid, author, ids)
+            done += 1
+            given += len(ids)
+        if i % 100 == 0:
+            await progress(f"{i:,} / {len(rows):,}개 확인 (별 {given:,}개 기록)")
+    s = _settings(guild.id)
+    s["star_givers_imported"] = True
+    activity.get_db().save_settings(guild.id, s)
+    return {"messages": len(rows), "done": done, "missing": missing, "given": given}
+
+
 # =====================================================================
 # 명령어
 # =====================================================================
+def build_star_info(guild_id: int, target, s: dict) -> discord.Embed:
+    """/스타정보 임베드 (칼봇 starboard stats 와 비슷한 내용)"""
+    got, works = user_stars(guild_id, target.id)
+    embed = discord.Embed(color=BOARD_COLOR)
+    embed.set_author(name=f"{target.display_name}님의 별 정보", icon_url=target.display_avatar.url)
+    embed.add_field(name=f"{STAR} 받은 별", value=f"**{got:,}**개 ({star_rank(guild_id, got)}위)")
+    embed.add_field(name="🖼️ 별 받은 작품", value=f"**{works:,}**개")
+    givers_ready = s.get("star_givers_imported")
+    if givers_ready:
+        given = stars_given(guild_id, target.id)
+        embed.add_field(name="🎁 준 별", value=f"**{given:,}**개 ({giver_rank(guild_id, given)}위)")
+    board = s.get("star_board_channel")
+    top = top_works_of(guild_id, target.id)
+    embed.add_field(
+        name="🏆 별 많이 받은 작품",
+        value="\n".join(format_work_line(i, guild_id, *row, board_channel_id=board) for i, row in enumerate(top, 1))
+        or "아직 없음",
+        inline=False,
+    )
+    if givers_ready:
+        def people(rows):
+            return "\n".join(f"{MEDALS[i]} <@{uid}> ({n}개)" for i, (uid, n) in enumerate(rows, 1)) or "아직 없음"
+
+        embed.add_field(name="💛 나에게 별을 많이 준 사람", value=people(fans_of(guild_id, target.id)))
+        embed.add_field(name="💫 내가 별을 많이 준 사람", value=people(favorites_of(guild_id, target.id)))
+    else:
+        embed.set_footer(text="누가 별을 줬는지는 관리자가 /스타관리 준사람가져오기 를 실행한 뒤에 표시됩니다.")
+    return embed
+
+
 ON_OFF = [app_commands.Choice(name="켜기", value=1), app_commands.Choice(name="끄기", value=0)]
 
 
@@ -691,23 +859,38 @@ async def _send_chunks(interaction: discord.Interaction, text: str) -> None:
 def register(tree: app_commands.CommandTree) -> None:
     ensure_tables()
 
-    @tree.command(name="스타순위", description="별(⭐)을 많이 받은 사람 순위(이미지)를 봅니다. 한 페이지에 10명씩.")
+    @tree.command(name="스타순위", description="별(⭐)을 많이 받은(또는 준) 사람 순위(이미지)를 봅니다. 한 페이지에 10명씩.")
     @app_commands.guild_only()
-    @app_commands.describe(페이지="볼 페이지 (1페이지 = 1~10위)")
-    async def star_ranking(interaction: discord.Interaction, 페이지: app_commands.Range[int, 1, 1000] = 1):
+    @app_commands.describe(기준="받은 별 순위 / 준 별 순위", 페이지="볼 페이지 (1페이지 = 1~10위)")
+    @app_commands.choices(
+        기준=[app_commands.Choice(name="받은 별", value="received"), app_commands.Choice(name="준 별", value="given")]
+    )
+    async def star_ranking(
+        interaction: discord.Interaction, 기준: str = "received", 페이지: app_commands.Range[int, 1, 1000] = 1
+    ):
         gid = interaction.guild_id
-        if not _settings(gid).get("stars_imported"):
+        s = _settings(gid)
+        if not s.get("stars_imported"):
             await interaction.response.send_message("📋 아직 별 기록이 없습니다. 관리자가 `/스타관리 가져오기`를 먼저 실행해야 합니다.", ephemeral=True)
             return
+        given_mode = 기준 == "given"
+        if given_mode and not s.get("star_givers_imported"):
+            await interaction.response.send_message("📋 아직 준 별 기록이 없습니다. 관리자가 `/스타관리 준사람가져오기`를 먼저 실행해야 합니다.", ephemeral=True)
+            return
         await interaction.response.defer(thinking=True)
-        total = count_star_users(gid)
+        if given_mode:
+            total, fetch = count_givers(gid), top_givers
+            title, unit, other = "준 별 순위", "준 별", "명에게"
+        else:
+            total, fetch = count_star_users(gid), top_stars
+            title, unit, other = "받은 별 순위", "별", "작품"
         pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
         page = min(페이지, pages)
-        rows = top_stars(gid, PAGE_SIZE, (page - 1) * PAGE_SIZE)
+        rows = fetch(gid, PAGE_SIZE, (page - 1) * PAGE_SIZE)
         if not rows:
             await interaction.followup.send("📋 아직 별 기록이 없습니다.")
             return
-        top = top_stars(gid, 1)[0][1]  # 막대 길이 = 1위 대비
+        top = fetch(gid, 1)[0][1]  # 막대 길이 = 1위 대비
         found = await activity.resolve_users(interaction.guild, interaction.client, [r[0] for r in rows])
         leader_rows = []
         for i, (uid, got, works) in enumerate(rows, start=(page - 1) * PAGE_SIZE + 1):
@@ -721,13 +904,27 @@ def register(tree: app_commands.CommandTree) -> None:
                     level=0,
                     progress=got / top if top else 0,
                     color=cards.grade_color(grade),
-                    label=f"별 {got:,} · 작품 {works:,}",
+                    label=(f"{unit} {got:,} · {works:,}{other}" if given_mode else f"{unit} {got:,} · {other} {works:,}"),
                 )
             )
         png = await asyncio.to_thread(cards.render_leaderboard, leader_rows)
         await interaction.followup.send(
-            f"{STAR} **받은 별 순위** — {page} / {pages} 페이지",
+            f"{STAR} **{title}** — {page} / {pages} 페이지",
             file=discord.File(io.BytesIO(png), filename="stars.png"),
+        )
+
+    @tree.command(name="스타정보", description="받은 별 · 준 별, 별 많이 받은 작품, 나에게 별을 많이 준 사람 등을 봅니다.")
+    @app_commands.guild_only()
+    @app_commands.describe(유저="확인할 유저 (비워두면 본인)")
+    async def star_info(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
+        target = 유저 or interaction.user
+        gid = interaction.guild_id
+        s = _settings(gid)
+        if not s.get("stars_imported"):
+            await interaction.response.send_message("📋 아직 별 기록이 없습니다. 관리자가 `/스타관리 가져오기`를 먼저 실행해야 합니다.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=build_star_info(gid, target, s), allowed_mentions=discord.AllowedMentions.none()
         )
 
     @tree.command(name="스타작품순위", description="별(⭐)을 많이 받은 작품 순위를 봅니다. 작품 바로가기 링크 포함, 10개씩.")
@@ -802,6 +999,46 @@ def register(tree: app_commands.CommandTree) -> None:
         )
         if r["unknown"]:
             text += f"\n- 작성자를 찾지 못한 스타보드 글 {r['unknown']}개는 빠졌습니다 (원본 삭제 + 기본 프로필)."
+        await status.edit(content=text)
+
+    @admin.command(name="준사람가져오기", description="별 받은 메시지마다 누가 별을 줬는지 읽어 옵니다. (/스타정보 · 준 별 순위용, 약 1시간)")
+    async def import_givers_cmd(interaction: discord.Interaction):
+        guild = interaction.guild
+        if not _settings(guild.id).get("stars_imported"):
+            await interaction.response.send_message("❌ 먼저 `/스타관리 가져오기`를 실행해 주세요.", ephemeral=True)
+            return
+        if guild.id in _importing:
+            await interaction.response.send_message("⏳ 이미 가져오는 중입니다. 끝나면 진행 메시지에 표시됩니다.", ephemeral=True)
+            return
+        _importing.add(guild.id)
+        await interaction.response.send_message(
+            "⏳ 누가 별을 줬는지 읽기 시작합니다. 디스코드 제한 때문에 메시지 1개에 1초 정도 걸립니다 (3천 개면 약 1시간).\n"
+            "그동안 봇을 재시작하면 처음부터 다시 해야 합니다. 진행 상황은 아래 메시지에 표시됩니다.",
+            ephemeral=True,
+        )
+        status = await interaction.channel.send("🎁 별 준 사람 가져오는 중...")
+
+        async def progress(text: str) -> None:
+            try:
+                await status.edit(content=f"🎁 별 준 사람 가져오는 중... {text}")
+            except discord.HTTPException:
+                pass
+
+        try:
+            r = await import_givers(guild, interaction.client.http, progress)
+        except Exception:
+            logger.exception("별 준 사람 가져오기 실패")
+            await status.edit(content="❌ 별 준 사람을 가져오다 오류가 났습니다. 다시 시도해 주세요.")
+            return
+        finally:
+            _importing.discard(guild.id)
+        text = (
+            "✅ **별 준 사람 가져오기 완료**\n"
+            f"- 별 받은 메시지 {r['messages']:,}개 중 {r['done']:,}개에서 별 {r['given']:,}개를 누가 줬는지 기록했습니다.\n"
+            "- 이제 `/스타정보`, `/스타순위 기준:준 별`을 쓸 수 있습니다."
+        )
+        if r["missing"]:
+            text += f"\n- 원본이 지워진 메시지 {r['missing']:,}개는 누가 줬는지 알 수 없어 빠졌습니다."
         await status.edit(content=text)
 
     @admin.command(name="칼봇맞추기", description="채널의 최근 칼봇 starboard stats · config 답변을 읽어 별 수 · 기준 · 제외 채널을 맞춥니다.")
