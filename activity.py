@@ -461,9 +461,9 @@ async def _avatar_bytes(user: Union[discord.Member, discord.User]) -> Optional[b
     return data
 
 
-async def _role_badge(role: discord.Role) -> cards.Badge:
+async def _role_badge(role: discord.Role, with_icon: bool = True) -> cards.Badge:
     icon = None
-    if isinstance(role.display_icon, discord.Asset):
+    if with_icon and isinstance(role.display_icon, discord.Asset):
         try:
             icon = await role.display_icon.replace(size=64, static_format="png").read()
         except discord.HTTPException:
@@ -472,7 +472,7 @@ async def _role_badge(role: discord.Role) -> cards.Badge:
     return cards.Badge(role.name, color, icon)
 
 
-async def _grade_badge(member: discord.Member) -> Optional[cards.Badge]:
+async def _grade_badge(member: discord.Member, with_icon: bool = True) -> Optional[cards.Badge]:
     """등급 시스템(/등급관리)에 등록된 등급 역할 중 이 멤버가 가진 가장 높은 등급"""
     try:
         config = json.loads(GRADE_CONFIG_FILE.read_text(encoding="utf-8"))
@@ -488,7 +488,7 @@ async def _grade_badge(member: discord.Member) -> Optional[cards.Badge]:
     if best is None:
         return None
     role = member.guild.get_role(int(best["role_id"]))
-    return await _role_badge(role) if role else cards.Badge(best.get("role_name", best["code"]))
+    return await _role_badge(role, with_icon) if role else cards.Badge(best.get("role_name", best["code"]))
 
 
 async def _member_badges(member: discord.Member, settings: dict) -> list[cards.Badge]:
@@ -604,7 +604,6 @@ def register(tree: app_commands.CommandTree) -> None:
             xp_needed=need,
             rank=database.xp_rank(gid, m["xp"]),
             coins=m["coins"],
-            accent=target.color.to_rgb() if target.color.value else cards.DEFAULT_ACCENT,
             grade=await _grade_badge(target),
             badges=await _member_badges(target, settings),
         )
@@ -656,6 +655,9 @@ def register(tree: app_commands.CommandTree) -> None:
                     avatar=await _avatar_bytes(who) if who else None,
                     level=level,
                     progress=cur / need if need else 0,
+                    color=cards.grade_color(
+                        await _grade_badge(who, with_icon=False) if isinstance(who, discord.Member) else None
+                    ),
                 )
             )
         png = await asyncio.to_thread(cards.render_leaderboard, leader_rows)

@@ -38,6 +38,7 @@ TRACK = (70, 74, 82)
 WHITE = (240, 242, 245)
 GRAY = (160, 165, 175)
 DEFAULT_ACCENT = (72, 187, 180)
+NO_GRADE = (128, 133, 142)  # 등급이 없을 때의 강조색 (회색)
 MEDALS = {1: (245, 196, 66), 2: (190, 196, 205), 3: (205, 127, 50)}
 
 # 글꼴에 없는 이모지 등은 네모(□)로 나오므로 지웁니다.
@@ -61,8 +62,7 @@ class RankCardData:
     xp_needed: int
     rank: int
     coins: int = 0
-    accent: tuple[int, int, int] = DEFAULT_ACCENT
-    grade: Optional[Badge] = None
+    grade: Optional[Badge] = None  # 서버 등급 (카드 오른쪽에 크게 표시, 카드 색도 이 등급 색)
     badges: list[Badge] = field(default_factory=list)
 
 
@@ -73,6 +73,7 @@ class LeaderRow:
     avatar: Optional[bytes]
     level: int
     progress: float  # 현재 레벨 안에서의 진행도 0~1
+    color: tuple[int, int, int] = NO_GRADE  # 막대 색 = 등급 색 (등급 없으면 회색)
 
 
 # ---------------------------------------------------------------------
@@ -196,24 +197,45 @@ def layout_badges(items, left: int, max_x: int) -> list[list[tuple[Badge, str, i
     return rows if rows[0] else []
 
 
+def grade_color(grade: Optional[Badge]) -> tuple[int, int, int]:
+    """카드 강조색 = 등급 역할 색 (등급이 없거나 역할 색이 없으면 회색)"""
+    if grade and grade.color and grade.color != GRAY:
+        return tuple(grade.color[:3])
+    return NO_GRADE
+
+
 def render_rank_card(d: RankCardData) -> bytes:
     W = 920
     ax, av_size = 44, 196
     left = ax + av_size + 40
-    items = ([(d.grade, "등급 ")] if d.grade else []) + [(b, "") for b in d.badges]
-    badge_rows = layout_badges(items, left, W - 44)
-    # 뱃지가 두 줄 이상이면 그만큼 카드를 아래로 늘립니다.
+    panel_left = W - 230  # 오른쪽 등급 영역
+    badge_rows = layout_badges([(b, "") for b in d.badges], left, W - 44)
+    # 뱃지가 두 줄 이상이면 그만큼 카드를 아래로 늘립니다. (뱃지가 없으면 그 자리는 비워 둠)
     extra = max(0, len(badge_rows) - 1) * (BADGE_H + BADGE_GAP_Y)
     H = 300 + extra
     img = Image.new("RGBA", (W, H), BG)
     draw = ImageDraw.Draw(img)
 
-    # 오른쪽 위 대각선 장식
-    accent = d.accent if d.accent and sum(d.accent) > 0 else DEFAULT_ACCENT
+    # 오른쪽 대각선 장식 (등급 색)
+    accent = grade_color(d.grade)
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(overlay).polygon([(W - 230, 0), (W, 0), (W, H), (W - 60, H)], fill=accent + (70,))
+    ImageDraw.Draw(overlay).polygon([(panel_left, 0), (W, 0), (W, H), (W - 60, H)], fill=accent + (70,))
     ImageDraw.Draw(overlay).polygon([(W - 120, 0), (W, 0), (W, H)], fill=accent + (120,))
     img.alpha_composite(overlay)
+
+    # 등급 (뱃지와 분리해서 오른쪽에 크게)
+    gx = W - 100
+    draw.text((gx, 72), "등급", font=font(22, False), fill=(225, 228, 232), anchor="mm")
+    if d.grade:
+        gfont = font(44)
+        gname = fit(draw, clean(d.grade.name), gfont, 170)
+        if draw.textlength(gname, font=gfont) > 170 or gname.endswith("…"):
+            gfont = font(30)
+            gname = fit(draw, clean(d.grade.name), gfont, 170)
+        draw.text((gx + 2, 122), gname, font=gfont, fill=(0, 0, 0), anchor="mm")  # 그림자
+        draw.text((gx, 120), gname, font=gfont, fill=WHITE, anchor="mm")
+    else:
+        draw.text((gx, 120), "없음", font=font(34), fill=(200, 203, 208), anchor="mm")
 
     # 아바타 (테두리 원) — 카드가 길어져도 위쪽 자리에 고정
     ay = (300 - av_size) // 2
@@ -221,14 +243,15 @@ def render_rank_card(d: RankCardData) -> bytes:
     avatar = circle(load_image(d.avatar, av_size))
     img.paste(avatar, (ax, ay), avatar)
 
-    right = W - 150
+    right = panel_left - 20
     width = right - left
 
     # 이름 · 아이디 · 코인
     name = fit(draw, clean(d.display_name), font(42), width)
     draw.text((left, 34), name, font=font(42), fill=WHITE)
-    draw.text((left, 92), fit(draw, "@" + clean(d.username), font(22, False), width - 160), font=font(22, False), fill=GRAY)
     coin_text = f"코인 {d.coins:,}"
+    coin_w = int(draw.textlength(coin_text, font=font(22)))
+    draw.text((left, 92), fit(draw, "@" + clean(d.username), font(22, False), width - coin_w - 20), font=font(22, False), fill=GRAY)
     draw.text((right, 92), coin_text, font=font(22), fill=GRAY, anchor="ra")
 
     # 레벨 · 순위 · 경험치
@@ -244,14 +267,14 @@ def render_rank_card(d: RankCardData) -> bytes:
         draw.text((x, y - 6), value, font=font(30), fill=color)
         x += int(draw.textlength(value, font=font(30))) + 26
 
-    # 등급 · 뱃지 (여러 줄)
+    # 뱃지 (여러 줄)
     y = 186
     for row in badge_rows:
         x = left
         for badge, prefix, w in row:
             label_badge = badge
             if badge_width(draw, badge, prefix) > w:  # 한 줄보다 긴 이름은 줄임표 처리
-                label_badge = Badge(fit(draw, clean(badge.name), font(20), w - 62 - int(draw.textlength(prefix, font=font(20)))), badge.color, badge.icon)
+                label_badge = Badge(fit(draw, clean(badge.name), font(20), w - 62), badge.color, badge.icon)
             draw_badge(img, draw, x, y, label_badge, height=BADGE_H, prefix=prefix)
             x += w + BADGE_GAP_X
         y += BADGE_H + BADGE_GAP_Y
@@ -266,7 +289,7 @@ def render_rank_card(d: RankCardData) -> bytes:
 # ---------------------------------------------------------------------
 # 리더보드
 # ---------------------------------------------------------------------
-def render_leaderboard(rows: list[LeaderRow], accent=DEFAULT_ACCENT) -> bytes:
+def render_leaderboard(rows: list[LeaderRow]) -> bytes:
     W = 720
     row_h, gap = 76, 6
     H = max(1, len(rows)) * (row_h + gap) - gap
@@ -299,7 +322,7 @@ def render_leaderboard(rows: list[LeaderRow], accent=DEFAULT_ACCENT) -> bytes:
         x += 20
         draw.text((x, cy), level_text, font=font(26), fill=WHITE, anchor="lm")
 
-        progress_bar(draw, (row_h + 16, y + row_h - 16, W - 24, y + row_h - 11), r.progress, accent)
+        progress_bar(draw, (row_h + 16, y + row_h - 16, W - 24, y + row_h - 11), r.progress, r.color)
 
     out = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     out.alpha_composite(img)
