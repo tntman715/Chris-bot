@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 import activity
 import bounty
+import stars
 
 # .env 파일에서 환경변수 로드
 load_dotenv()
@@ -734,12 +735,38 @@ class ChrisBot(discord.Client):
             await activity.handle_message(message)
         except Exception:
             logger.exception("활동량 기록 중 오류")
+        try:
+            await stars.handle_message(message)
+        except Exception:
+            logger.exception("칼봇 스타보드 메시지 처리 중 오류")
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         try:
             await activity.handle_reaction(payload, self)
         except Exception:
             logger.exception("반응 경험치 기록 중 오류")
+        try:
+            await stars.handle_reaction_add(payload, self)
+        except Exception:
+            logger.exception("별 기록 중 오류")
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        try:
+            await stars.handle_reaction_remove(payload, self)
+        except Exception:
+            logger.exception("별 기록 중 오류")
+
+    async def on_raw_reaction_clear(self, payload: discord.RawReactionClearEvent):
+        try:
+            await stars.handle_reaction_clear(payload.guild_id, payload.message_id)
+        except Exception:
+            logger.exception("별 기록 중 오류")
+
+    async def on_raw_reaction_clear_emoji(self, payload: discord.RawReactionClearEmojiEvent):
+        try:
+            await stars.handle_reaction_clear(payload.guild_id, payload.message_id, payload.emoji)
+        except Exception:
+            logger.exception("별 기록 중 오류")
 
     async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent):
         try:
@@ -751,6 +778,7 @@ class ChrisBot(discord.Client):
 bot = ChrisBot()
 activity.register(bot.tree)
 bounty.register(bot.tree)
+stars.register(bot.tree)
 
 
 # =====================================================================

@@ -62,6 +62,7 @@ class RankCardData:
     xp_needed: int
     rank: int
     coins: int = 0
+    stars: Optional[int] = None  # 받은 별 (기록이 없으면 None → 표시 안 함)
     grade: Optional[Badge] = None  # 서버 등급 (카드 오른쪽에 크게 표시, 카드 색도 이 등급 색)
     badges: list[Badge] = field(default_factory=list)
 
@@ -250,6 +251,8 @@ def render_rank_card(d: RankCardData) -> bytes:
     name = fit(draw, clean(d.display_name), font(42), width)
     draw.text((left, 34), name, font=font(42), fill=WHITE)
     coin_text = f"코인 {d.coins:,}"
+    if d.stars is not None:
+        coin_text = f"별 {d.stars:,} · " + coin_text
     coin_w = int(draw.textlength(coin_text, font=font(22)))
     draw.text((left, 92), fit(draw, "@" + clean(d.username), font(22, False), width - coin_w - 20), font=font(22, False), fill=GRAY)
     draw.text((right, 92), coin_text, font=font(22), fill=GRAY, anchor="ra")

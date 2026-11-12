@@ -626,6 +626,12 @@ def register(tree: app_commands.CommandTree) -> None:
             ).fetchone()[0]
         except sqlite3.OperationalError:
             solved = 0
+        star_line = ""
+        import stars  # 순환 import 방지 (stars 가 activity 를 import)
+
+        if database.get_settings(gid).get("stars_imported"):
+            got, works = stars.user_stars(gid, target.id)
+            star_line = f"\n- **받은 별**: {stars.STAR} {got:,} (작품 {works:,}개, 별 순위 {stars.star_rank(gid, got)}위)"
 
         msg = (
             f"### 📊 {target.mention}님의 활동량\n"
@@ -634,6 +640,7 @@ def register(tree: app_commands.CommandTree) -> None:
             f"- **보유 {CURRENCY_NAME}**: {m['coins']} {CURRENCY_EMOJI}\n"
             f"- **기여 점수**: {m['contribution']} (작품 처리 {solved}회)\n"
             f"- **채팅 수**: 오늘 {today} · 최근 7일 {week} · 최근 30일 {month} · 전체 {m['messages']}"
+            + star_line
         )
         await interaction.response.send_message(msg, ephemeral=True)
 
@@ -686,6 +693,9 @@ def register(tree: app_commands.CommandTree) -> None:
         _apply_role_floor(database, target, settings)
         m = database.get_member(gid, target.id)
         level, cur, need = level_progress(m["xp"])
+        import stars  # 순환 import 방지
+
+        got = stars.user_stars(gid, target.id)[0] if settings.get("stars_imported") else None
         data = cards.RankCardData(
             display_name=target.display_name,
             username=target.name,
@@ -695,6 +705,7 @@ def register(tree: app_commands.CommandTree) -> None:
             xp_needed=need,
             rank=database.xp_rank(gid, m["xp"]),
             coins=m["coins"],
+            stars=got,
             grade=await _grade_badge(target),
             badges=await _member_badges(target, settings),
         )
