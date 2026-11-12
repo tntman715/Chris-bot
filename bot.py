@@ -735,7 +735,7 @@ class ChrisBot(discord.Client):
 
     async def on_message(self, message: discord.Message):
         try:
-            await activity.handle_message(message)
+            await activity.handle_message(message, self)
         except Exception:
             logger.exception("활동량 기록 중 오류")
         try:

@@ -62,7 +62,10 @@ DEFAULT_SETTINGS = {
     "badge_roles": [],  # /랭크 카드에 뱃지로 보여 줄 역할 ID (등록 순서대로 표시)
     "work_channels": [],  # 작업물 채널 — 사진·영상을 올리면 경험치 보너스 (스레드는 상위 채널 기준)
     "request_channels": [],  # 작품신청 포럼 채널 (bounty.py 현상금 시스템)
+    "linked_guilds": [],  # 연동 서버 ID — 그 서버들의 채팅 · 반응도 이 서버(메인)의 레벨 · 코인에 합산
+    "coin_xp_rate": 10,  # /코인환전: 코인 1개당 경험치 (0이면 환전 끔)
 }
+DEFAULT_COIN_XP_RATE = 10
 
 
 # =====================================================================
@@ -161,6 +164,7 @@ class ActivityDB:
         )
         self.conn.commit()
         self._settings_cache: dict[int, dict] = {}
+        self._home_cache: Optional[dict[int, int]] = None
 
     # ---------------- 설정 ----------------
     def get_settings(self, guild_id: int) -> dict:
@@ -183,6 +187,29 @@ class ActivityDB:
         )
         self.conn.commit()
         self._settings_cache[guild_id] = settings
+        self._home_cache = None
+
+    def home_guild(self, guild_id: int) -> int:
+        """연동 서버면 메인 서버 ID, 아니면 그대로. 레벨 · 코인 · 순위는 메인 서버 기준으로 모읍니다."""
+        if self._home_cache is None:
+            self._home_cache = {}
+            for gid, data in self.conn.execute("SELECT guild_id, data FROM guild_settings"):
+                for linked in json.loads(data).get("linked_guilds", []):
+                    self._home_cache[int(linked)] = gid
+        return self._home_cache.get(guild_id, guild_id)
+
+    def exchange_coins(self, guild_id: int, user_id: int, coins: int, xp_per_coin: int) -> Optional[tuple[int, int, int]]:
+        """코인을 경험치로 바꿉니다. 코인이 모자라면 None, 아니면 (남은 코인, 이전 경험치, 새 경험치)"""
+        m = self.get_member(guild_id, user_id)
+        if coins <= 0 or m["coins"] < coins:
+            return None
+        gain = coins * xp_per_coin
+        self.conn.execute(
+            "UPDATE members SET coins = coins - ?, xp = xp + ? WHERE guild_id = ? AND user_id = ?",
+            (coins, gain, guild_id, user_id),
+        )
+        self.conn.commit()
+        return m["coins"] - coins, m["xp"], m["xp"] + gain
 
     # ---------------- 활동 기록 ----------------
     def record_message(
@@ -395,8 +422,9 @@ def _apply_role_floor(database: "ActivityDB", member: discord.Member, settings: 
         logger.info(f"레벨 역할 기준 복원: {member} 레벨 {level_from_xp(current)} → {floor_level}")
 
 
-async def handle_message(message: discord.Message) -> None:
-    """모든 채팅마다 호출됩니다. 내용은 저장하지 않고 길이와 첨부 여부만 사용합니다."""
+async def handle_message(message: discord.Message, client: Optional[discord.Client] = None) -> None:
+    """모든 채팅마다 호출됩니다. 내용은 저장하지 않고 길이와 첨부 여부만 사용합니다.
+    연동 서버의 채팅은 메인 서버의 레벨 · 코인에 합산합니다 (제외 · 작업물 채널은 그 서버 설정)."""
     if message.author.bot or message.guild is None:
         return
     if message.type not in (discord.MessageType.default, discord.MessageType.reply):
@@ -409,12 +437,15 @@ async def handle_message(message: discord.Message) -> None:
     settings = database.get_settings(guild_id)
     if _is_excluded(message.channel, settings):
         return
-    _apply_role_floor(database, message.author, settings)
+    home_id = database.home_guild(guild_id)
+    home_settings = database.get_settings(home_id)
+    if home_id == guild_id:
+        _apply_role_floor(database, message.author, settings)
 
     length = len(message.content or "")
     has_media = any(_is_media(a) for a in message.attachments)
 
-    key = (guild_id, message.author.id)
+    key = (home_id, message.author.id)  # 쿨다운도 메인 서버 기준 하나 (여러 서버를 돌며 부풀리기 방지)
     now = time.monotonic()
     awarded = now - _last_award.get(key, -1e9) >= XP_COOLDOWN_SECONDS
     xp_gain = coin_gain = 0
@@ -430,13 +461,13 @@ async def handle_message(message: discord.Message) -> None:
             xp_gain += WORK_MEDIA_XP_BONUS
 
     old_xp, new_xp = database.record_message(
-        guild_id, message.author.id, length, has_media, xp_gain, coin_gain
+        home_id, message.author.id, length, has_media, xp_gain, coin_gain
     )
 
-    if xp_gain and settings.get("live"):
+    if xp_gain and home_settings.get("live"):
         old_level, new_level = level_from_xp(old_xp), level_from_xp(new_xp)
         if new_level > old_level:
-            await _on_level_up(message.channel, message.author, new_level, settings)
+            await level_up(client, message.channel, message.author, home_id, new_level, home_settings)
 
 
 _last_reaction_award: dict[tuple[int, int], float] = {}
@@ -452,17 +483,20 @@ async def handle_reaction(payload: discord.RawReactionActionEvent, client: disco
     channel = client.get_channel(payload.channel_id)
     if channel is not None and _is_excluded(channel, settings):
         return
-    _apply_role_floor(database, member, settings)
+    home_id = database.home_guild(payload.guild_id)
+    home_settings = database.get_settings(home_id)
+    if home_id == payload.guild_id:
+        _apply_role_floor(database, member, settings)
 
-    key = (payload.guild_id, member.id)
+    key = (home_id, member.id)
     now = time.monotonic()
     if now - _last_reaction_award.get(key, -1e9) < REACTION_COOLDOWN_SECONDS:
         return
     _last_reaction_award[key] = now
 
-    old_xp, new_xp = database.add_xp(payload.guild_id, member.id, REACTION_XP, coins=REACTION_COIN)
-    if settings.get("live") and level_from_xp(new_xp) > level_from_xp(old_xp) and channel is not None:
-        await _on_level_up(channel, member, level_from_xp(new_xp), settings)
+    old_xp, new_xp = database.add_xp(home_id, member.id, REACTION_XP, coins=REACTION_COIN)
+    if home_settings.get("live") and level_from_xp(new_xp) > level_from_xp(old_xp) and channel is not None:
+        await level_up(client, channel, member, home_id, level_from_xp(new_xp), home_settings)
 
 
 def plan_level_roles(
@@ -526,6 +560,42 @@ async def _on_level_up(
         await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException as e:
         logger.warning(f"레벨업 알림 전송 실패: {e}")
+
+
+async def home_member(
+    client: Optional[discord.Client], home_id: int, member: discord.Member
+) -> Optional[discord.Member]:
+    """메인 서버에서의 같은 사람 (연동 서버에서 왔을 때). 메인 서버에 없으면 None"""
+    if member.guild.id == home_id:
+        return member
+    guild = client.get_guild(home_id) if client else None
+    if guild is None:
+        return None
+    found = guild.get_member(member.id)
+    if found is None:
+        try:
+            found = await guild.fetch_member(member.id)
+        except discord.HTTPException:
+            found = None
+    return found
+
+
+async def level_up(
+    client: Optional[discord.Client], source_channel, member: discord.Member,
+    home_id: int, new_level: int, home_settings: dict,
+) -> None:
+    """레벨업 처리. 연동 서버에서 올랐어도 레벨 역할 · 알림 채널은 메인 서버 기준입니다."""
+    main_member = await home_member(client, home_id, member)
+    if main_member is None:  # 메인 서버에 없는 사람: 역할 없이 그 자리에서 알림만
+        try:
+            await source_channel.send(
+                f"{member.mention} 이(가) **{new_level}** 레벨을 달성했습니다",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException as e:
+            logger.warning(f"레벨업 알림 전송 실패: {e}")
+        return
+    await _on_level_up(source_channel, main_member, new_level, home_settings)
 
 
 def _normalize_name(name: str) -> str:
@@ -662,7 +732,7 @@ def register(tree: app_commands.CommandTree) -> None:
     async def show_activity(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
         target = 유저 or interaction.user
         database = get_db()
-        gid = interaction.guild_id
+        gid = database.home_guild(interaction.guild_id)
         m = database.get_member(gid, target.id)
         level, cur, need = level_progress(m["xp"])
         rank = database.xp_rank(gid, m["xp"])
@@ -712,7 +782,7 @@ def register(tree: app_commands.CommandTree) -> None:
     )
     async def show_ranking(interaction: discord.Interaction, 기준: str = "xp"):
         database = get_db()
-        gid = interaction.guild_id
+        gid = database.home_guild(interaction.guild_id)
         if 기준 == "week":
             rows, title, fmt = database.top_recent(gid, day_kst(6)), "최근 7일 채팅 수", lambda v: f"{v}개"
         elif 기준 == "month":
@@ -746,9 +816,12 @@ def register(tree: app_commands.CommandTree) -> None:
             return
         await interaction.response.defer(thinking=True)
         database = get_db()
-        gid = interaction.guild_id
+        gid = database.home_guild(interaction.guild_id)
         settings = database.get_settings(gid)
-        _apply_role_floor(database, target, settings)
+        # 연동 서버에서 보면 등급 · 뱃지는 메인 서버에서의 역할 기준
+        main_member = await home_member(interaction.client, gid, target) or target
+        if main_member.guild.id == gid:
+            _apply_role_floor(database, main_member, settings)
         m = database.get_member(gid, target.id)
         level, cur, need = level_progress(m["xp"])
         import stars  # 순환 import 방지
@@ -764,8 +837,8 @@ def register(tree: app_commands.CommandTree) -> None:
             rank=database.xp_rank(gid, m["xp"]),
             coins=m["coins"],
             stars=got,
-            grade=await _grade_badge(target),
-            badges=await _member_badges(target, settings),
+            grade=await _grade_badge(main_member),
+            badges=await _member_badges(main_member, settings),
         )
         png = await asyncio.to_thread(cards.render_rank_card, data)
         await interaction.followup.send(file=discord.File(io.BytesIO(png), filename="rank.png"))
@@ -776,12 +849,13 @@ def register(tree: app_commands.CommandTree) -> None:
     async def leaderboard(interaction: discord.Interaction, 페이지: app_commands.Range[int, 1, 1000] = 1):
         await interaction.response.defer(thinking=True)
         database = get_db()
-        guild = interaction.guild
-        total = database.count_ranked(guild.id)
+        gid = database.home_guild(interaction.guild_id)
+        guild = interaction.client.get_guild(gid) or interaction.guild  # 이름 · 등급 색은 메인 서버 기준
+        total = database.count_ranked(gid)
         pages = max(1, (total + 9) // 10)
         page = min(페이지, pages)
         offset = (page - 1) * 10
-        rows = database.top_members(guild.id, "xp", 10, offset)
+        rows = database.top_members(gid, "xp", 10, offset)
         if not rows:
             await interaction.followup.send("📋 아직 레벨 기록이 없습니다.")
             return
@@ -810,6 +884,36 @@ def register(tree: app_commands.CommandTree) -> None:
             file=discord.File(io.BytesIO(png), filename="leaderboard.png"),
         )
 
+    @tree.command(name="코인환전", description=f"{CURRENCY_NAME}을 경험치로 바꿉니다.")
+    @app_commands.guild_only()
+    @app_commands.describe(코인=f"경험치로 바꿀 {CURRENCY_NAME} 수")
+    async def exchange(interaction: discord.Interaction, 코인: app_commands.Range[int, 1, 1_000_000]):
+        database = get_db()
+        gid = database.home_guild(interaction.guild_id)
+        settings = database.get_settings(gid)
+        rate = int(settings.get("coin_xp_rate", DEFAULT_COIN_XP_RATE) or 0)
+        if rate <= 0:
+            await interaction.response.send_message(f"❌ 지금은 {CURRENCY_NAME} 환전이 꺼져 있습니다.", ephemeral=True)
+            return
+        result = database.exchange_coins(gid, interaction.user.id, 코인, rate)
+        if result is None:
+            balance = database.get_member(gid, interaction.user.id)["coins"]
+            await interaction.response.send_message(
+                f"❌ {CURRENCY_NAME}이 부족합니다. *(보유: {balance} {CURRENCY_EMOJI}, 바꾸려는 양: {코인})*",
+                ephemeral=True,
+            )
+            return
+        left, old_xp, new_xp = result
+        level, cur, need = level_progress(new_xp)
+        await interaction.response.send_message(
+            f"✅ {코인} {CURRENCY_EMOJI} → **{코인 * rate:,} XP**로 바꿨습니다. "
+            f"*({CURRENCY_NAME} 1개 = {rate} XP, 남은 {CURRENCY_NAME}: {left} {CURRENCY_EMOJI})*\n"
+            f"- **레벨 {level}** `{_progress_bar(cur, need)}` {cur} / {need} XP",
+            ephemeral=True,
+        )
+        if level > level_from_xp(old_xp) and settings.get("live") and isinstance(interaction.user, discord.Member):
+            await level_up(interaction.client, interaction.channel, interaction.user, gid, level, settings)
+
     admin = app_commands.Group(
         name="레벨관리",
         description="[관리자용] 레벨 · 활동량 · 코인 시스템을 설정합니다.",
@@ -825,6 +929,8 @@ def register(tree: app_commands.CommandTree) -> None:
         ]
     )
     async def toggle_live(interaction: discord.Interaction, 상태: int):
+        if not await _main_only(interaction):
+            return
         database = get_db()
         s = database.get_settings(interaction.guild_id)
         s["live"] = bool(상태)
@@ -1044,7 +1150,19 @@ def register(tree: app_commands.CommandTree) -> None:
 
     @admin.command(name="설정목록", description="레벨 · 활동량 시스템의 현재 설정을 확인합니다.")
     async def show_settings(interaction: discord.Interaction):
-        s = get_db().get_settings(interaction.guild_id)
+        database = get_db()
+        s = database.get_settings(interaction.guild_id)
+        home = database.home_guild(interaction.guild_id)
+        linked_note = ""
+        if home != interaction.guild_id:
+            main = interaction.client.get_guild(home)
+            linked_note = (f"> 🔗 이 서버는 **{main.name if main else home}** 서버에 연동되어 있어, "
+                           "활동이 그 서버 레벨 · 코인에 합산됩니다. 여기서는 제외 · 작업물 채널만 쓰입니다.\n")
+        linked_names = ", ".join(
+            (interaction.client.get_guild(int(g)).name if interaction.client.get_guild(int(g)) else str(g))
+            for g in s.get("linked_guilds", [])
+        ) or "없음"
+        rate = int(s.get("coin_xp_rate", DEFAULT_COIN_XP_RATE) or 0)
         live = "🟢 켜짐" if s.get("live") else "⚪ 꺼짐 (경험치·코인은 적립 중)"
         announce = f"<#{s['announce_channel_id']}>" if s.get("announce_channel_id") else "채팅한 채널"
         excluded = ", ".join(f"<#{c}>" for c in s.get("excluded_channels", [])) or "없음"
@@ -1054,7 +1172,10 @@ def register(tree: app_commands.CommandTree) -> None:
         bonus = ", ".join(f"{n}자 이상 +{b}" for n, b in sorted(COIN_LENGTH_BONUS))
         msg = (
             "### ⚙️ 레벨 · 활동량 설정\n"
+            + linked_note +
             f"- **레벨업 알림 · 역할 지급**: {live}\n"
+            f"- **연동 서버** (활동 합산): {linked_names}\n"
+            f"- **코인 환전** (`/코인환전`): {f'{CURRENCY_NAME} 1개 = {rate} XP' if rate else '꺼짐'}\n"
             f"- **레벨업 알림 채널**: {announce}\n"
             f"- **활동량 제외 채널**: {excluded}\n"
             f"- **작업물 채널** (사진·영상 경험치 보너스): {work}\n"
@@ -1141,6 +1262,8 @@ def register(tree: app_commands.CommandTree) -> None:
         레벨: app_commands.Range[int, 0, 1000],
         추가경험치: app_commands.Range[int, 0, 10_000_000] = 0,
     ):
+        if not await _main_only(interaction):
+            return
         database = get_db()
         new_xp = total_xp_for_level(레벨) + min(추가경험치, xp_to_next(레벨) - 1)
         old_xp = database.set_xp(interaction.guild_id, 유저.id, new_xp)
@@ -1155,9 +1278,114 @@ def register(tree: app_commands.CommandTree) -> None:
             ephemeral=True,
         )
 
+    async def _main_only(interaction: discord.Interaction) -> bool:
+        """연동 서버에서는 메인 서버 설정을 바꿀 수 없게 막습니다."""
+        home = get_db().home_guild(interaction.guild_id)
+        if home == interaction.guild_id:
+            return True
+        main = interaction.client.get_guild(home)
+        await interaction.response.send_message(
+            f"❌ 이 서버는 **{main.name if main else home}** 서버에 연동되어 있습니다. 이 설정은 메인 서버에서 해 주세요.",
+            ephemeral=True,
+        )
+        return False
+
+    @admin.command(name="환전비율", description=f"/코인환전: {CURRENCY_NAME} 1개를 경험치 몇으로 바꿀지 정합니다. (0 = 환전 끔)")
+    @app_commands.describe(경험치=f"{CURRENCY_NAME} 1개당 경험치 (기본 {DEFAULT_COIN_XP_RATE}, 0이면 환전 끔)")
+    async def set_exchange_rate(interaction: discord.Interaction, 경험치: app_commands.Range[int, 0, 1000]):
+        if not await _main_only(interaction):
+            return
+        database = get_db()
+        s = database.get_settings(interaction.guild_id)
+        s["coin_xp_rate"] = 경험치
+        database.save_settings(interaction.guild_id, s)
+        text = (f"✅ 이제 {CURRENCY_NAME} 1개 = **{경험치} XP**로 바꿀 수 있습니다." if 경험치
+                else f"✅ {CURRENCY_NAME} 환전을 껐습니다.")
+        await interaction.response.send_message(text, ephemeral=True)
+
+    async def _guild_choices(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        cur = (current or "").lower()
+        out = []
+        for g in interaction.client.guilds:
+            if g.id == interaction.guild_id:
+                continue
+            if cur and cur not in g.name.lower() and cur not in str(g.id):
+                continue
+            out.append(app_commands.Choice(name=f"{g.name} ({g.member_count or '?'}명)"[:100], value=str(g.id)))
+        return out[:25]
+
+    async def _linked_choices(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        out = []
+        for gid in get_db().get_settings(interaction.guild_id).get("linked_guilds", []):
+            g = interaction.client.get_guild(int(gid))
+            out.append(app_commands.Choice(name=(g.name if g else str(gid))[:100], value=str(gid)))
+        return out[:25]
+
+    @admin.command(name="연동서버추가", description="다른 서버의 채팅 · 반응을 이 서버의 레벨 · 코인 · 순위에 합산합니다.")
+    @app_commands.describe(서버="연동할 서버 (크리스봇이 들어가 있는 서버 목록에서 고르기)")
+    @app_commands.autocomplete(서버=_guild_choices)
+    async def add_linked_guild(interaction: discord.Interaction, 서버: str):
+        database = get_db()
+        gid = interaction.guild_id
+        target = interaction.client.get_guild(int(서버)) if 서버.isdigit() else None
+        if target is None:
+            await interaction.response.send_message("❌ 크리스봇이 들어가 있는 서버를 목록에서 골라 주세요.", ephemeral=True)
+            return
+        if target.id == gid:
+            await interaction.response.send_message("❌ 이 서버 자신은 연동할 수 없습니다.", ephemeral=True)
+            return
+        if not await _main_only(interaction):
+            return
+        other_home = database.home_guild(target.id)
+        if other_home not in (target.id, gid):
+            await interaction.response.send_message(f"❌ **{target.name}**은(는) 이미 다른 서버에 연동되어 있습니다.", ephemeral=True)
+            return
+        if database.get_settings(target.id).get("linked_guilds"):
+            await interaction.response.send_message(
+                f"❌ **{target.name}**은(는) 다른 서버들을 연동해 둔 메인 서버라 연동할 수 없습니다.", ephemeral=True)
+            return
+        s = database.get_settings(gid)
+        linked = s.setdefault("linked_guilds", [])
+        if target.id in linked:
+            await interaction.response.send_message(f"ℹ️ **{target.name}**은(는) 이미 연동되어 있습니다.", ephemeral=True)
+            return
+        linked.append(target.id)
+        database.save_settings(gid, s)
+        old_rows = database.count_ranked(target.id)
+        note = (f"\n- ⚠️ 그 서버에 따로 쌓여 있던 기록 {old_rows}명분은 합쳐지지 않고 그대로 남습니다." if old_rows else "")
+        await interaction.response.send_message(
+            f"🔗 **{target.name}** 서버를 연동했습니다.\n"
+            f"- 이제 그 서버의 채팅 · 반응도 **이 서버의 레벨 · {CURRENCY_NAME} · 순위**에 합산됩니다. "
+            "쿨다운도 두 서버를 통틀어 하나로 셉니다.\n"
+            "- 레벨업 알림 · 레벨 역할은 이 서버 기준입니다. (이 서버에 없는 사람은 그 서버 채널에 알림만)\n"
+            f"- 그 서버에서 `/랭크` `/활동량` `/순위` `/리더보드` `/코인환전`을 써도 이 서버 기록이 나옵니다.\n"
+            "- 제외 채널 · 작업물 채널은 그 서버에서 `/레벨관리 제외채널추가` 등으로 따로 정합니다." + note,
+            ephemeral=True,
+        )
+        logger.info(f"연동 서버 추가: {gid} ← {target.id}")
+
+    @admin.command(name="연동서버제거", description="연동한 서버를 뺍니다. (이미 합산된 기록은 그대로 남습니다)")
+    @app_commands.describe(서버="뺄 연동 서버")
+    @app_commands.autocomplete(서버=_linked_choices)
+    async def remove_linked_guild(interaction: discord.Interaction, 서버: str):
+        database = get_db()
+        s = database.get_settings(interaction.guild_id)
+        linked = s.get("linked_guilds", [])
+        target_id = int(서버) if 서버.isdigit() else 0
+        if target_id not in linked:
+            await interaction.response.send_message("ℹ️ 연동되어 있지 않은 서버입니다.", ephemeral=True)
+            return
+        linked.remove(target_id)
+        database.save_settings(interaction.guild_id, s)
+        g = interaction.client.get_guild(target_id)
+        await interaction.response.send_message(
+            f"✅ **{g.name if g else target_id}** 서버 연동을 해제했습니다. 이미 합산된 기록은 그대로 남습니다.", ephemeral=True)
+
     @admin.command(name="코인조정", description=f"유저의 {CURRENCY_NAME}을 더하거나 뺍니다. (빼려면 음수 입력)")
     @app_commands.describe(유저="대상 유저", 양="더할 양 (빼려면 -10 처럼 음수)")
     async def adjust_coins(interaction: discord.Interaction, 유저: discord.Member, 양: int):
+        if not await _main_only(interaction):
+            return
         balance = get_db().add_coins(interaction.guild_id, 유저.id, 양)
         sign = "+" if 양 >= 0 else ""
         await interaction.response.send_message(
