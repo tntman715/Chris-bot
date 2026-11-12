@@ -234,6 +234,11 @@ class ActivityDB:
             (guild_id, limit, offset),
         ).fetchall()
 
+    def all_xp(self, guild_id: int) -> list[tuple[int, int]]:
+        return self.conn.execute(
+            "SELECT user_id, xp FROM members WHERE guild_id = ? AND xp > 0", (guild_id,)
+        ).fetchall()
+
     def count_ranked(self, guild_id: int) -> int:
         return self.conn.execute(
             "SELECT COUNT(*) FROM members WHERE guild_id = ? AND xp > 0", (guild_id,)
@@ -389,26 +394,46 @@ async def handle_reaction(payload: discord.RawReactionActionEvent, client: disco
         await _on_level_up(channel, member, level_from_xp(new_xp), settings)
 
 
-async def sync_level_roles(member: discord.Member, level: int, settings: dict) -> Optional[discord.Role]:
-    """도달한 가장 높은 레벨 역할 하나만 남기고 나머지 레벨 역할은 제거합니다. 새로 준 역할을 반환."""
-    level_roles = {int(k): int(v) for k, v in settings.get("level_roles", {}).items()}
-    if not level_roles:
-        return None
-    reached = [lv for lv in level_roles if lv <= level]
-    target_id = level_roles[max(reached)] if reached else None
-    all_ids = set(level_roles.values())
+def plan_level_roles(
+    member_role_ids: set[int], level: int, level_roles: dict
+) -> tuple[Optional[int], set[int]]:
+    """
+    레벨 역할 계획: (줘야 할 역할 ID 또는 None, 빼야 할 역할 ID들)
+    도달한 가장 높은 레벨 역할 하나만 남기고 아래 레벨 역할은 회수합니다 (주인 결정: 하나만 유지).
+    """
+    roles = {int(k): int(v) for k, v in level_roles.items()}
+    reached = [lv for lv in roles if lv <= level]
+    target_id = roles[max(reached)] if reached else None
+    to_remove = {rid for rid in member_role_ids if rid in set(roles.values()) and rid != target_id}
+    to_add = target_id if target_id and target_id not in member_role_ids else None
+    return to_add, to_remove
 
-    to_remove = [r for r in member.roles if r.id in all_ids and r.id != target_id]
-    target_role = member.guild.get_role(target_id) if target_id else None
-    added = None
+
+async def apply_level_roles(
+    member: discord.Member, level: int, settings: dict
+) -> tuple[str, Optional[discord.Role]]:
+    """레벨 역할을 실제로 맞춥니다. 결과: ("changed" | "same" | "failed", 새로 준 역할)"""
+    to_add_id, to_remove_ids = plan_level_roles(
+        {r.id for r in member.roles}, level, settings.get("level_roles", {})
+    )
+    if to_add_id is None and not to_remove_ids:
+        return "same", None
+    to_remove = [r for r in member.roles if r.id in to_remove_ids]
+    target_role = member.guild.get_role(to_add_id) if to_add_id else None
     try:
         if to_remove:
             await member.remove_roles(*to_remove, reason="레벨 역할 갱신")
-        if target_role and target_role not in member.roles:
+        if target_role:
             await member.add_roles(target_role, reason=f"레벨 {level} 달성")
-            added = target_role
     except discord.HTTPException as e:
         logger.warning(f"레벨 역할 변경 실패 ({member}): {e}")
+        return "failed", None
+    return "changed", target_role
+
+
+async def sync_level_roles(member: discord.Member, level: int, settings: dict) -> Optional[discord.Role]:
+    """레벨 역할을 맞추고 새로 준 역할을 반환합니다."""
+    _, added = await apply_level_roles(member, level, settings)
     return added
 
 
@@ -785,6 +810,61 @@ def register(tree: app_commands.CommandTree) -> None:
             "*(가장 높은 레벨 역할 하나만 남기고 아래 레벨 역할은 회수합니다.)*",
             ephemeral=True,
         )
+
+    @admin.command(
+        name="역할동기화",
+        description="레벨 기록이 있는 모든 사람의 레벨 역할을 현재 레벨에 맞게 한꺼번에 정리합니다.",
+    )
+    async def sync_all_level_roles(interaction: discord.Interaction):
+        guild = interaction.guild
+        database = get_db()
+        settings = database.get_settings(guild.id)
+        if not settings.get("level_roles"):
+            await interaction.response.send_message(
+                "ℹ️ 등록된 레벨 역할이 없습니다. 먼저 `/레벨관리 레벨역할추가`로 등록해 주세요.", ephemeral=True
+            )
+            return
+        if not settings.get("live"):
+            # Arcane 기록을 가져오기 전에 실행하면, 크리스봇 경험치가 아직 낮아 Arcane이 준 역할을 회수해 버림
+            await interaction.response.send_message(
+                "⚠️ 레벨 기능이 아직 꺼져 있어 실행하지 않았습니다.\n"
+                "Arcane 기록을 가져오기 전에 정리하면 크리스봇 레벨이 아직 낮아서 **기존 레벨 역할이 회수될 수 있습니다.**\n"
+                "`/레벨관리 아케인가져오기` → `/레벨관리 레벨기능 켜기` 후에 다시 실행해 주세요.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = database.all_xp(guild.id)
+        counts = {"changed": 0, "same": 0, "failed": 0}
+        missing = 0
+        for start in range(0, len(rows), 100):
+            chunk = dict(rows[start : start + 100])
+            try:
+                members = await guild.query_members(user_ids=list(chunk), limit=100, cache=False)
+            except (asyncio.TimeoutError, discord.HTTPException) as e:
+                logger.warning(f"역할동기화 멤버 조회 실패: {e}")
+                members = []
+            missing += len(chunk) - len(members)
+            for member in members:
+                result, _ = await apply_level_roles(member, level_from_xp(chunk[member.id]), settings)
+                counts[result] += 1
+                if result == "changed":
+                    await asyncio.sleep(0.5)  # 디스코드 요청 속도 제한 보호
+            await asyncio.sleep(1)
+
+        text = (
+            f"✅ **레벨 역할 정리 완료** (기록이 있는 {len(rows)}명 확인)\n"
+            f"- 역할을 바꾼 사람: **{counts['changed']}명**\n"
+            f"- 이미 맞아서 그대로 둔 사람: {counts['same']}명\n"
+            f"- 서버를 나가서 건너뛴 사람: {missing}명"
+        )
+        if counts["failed"]:
+            text += (
+                f"\n- ⚠️ 바꾸지 못한 사람: {counts['failed']}명 "
+                "*(봇에게 `역할 관리` 권한이 있고, 봇 역할이 레벨 역할들보다 위에 있는지 확인해 주세요)*"
+            )
+        await interaction.followup.send(text, ephemeral=True)
 
     @admin.command(name="레벨역할제거", description="레벨 역할 설정을 지웁니다.")
     async def remove_level_role(interaction: discord.Interaction, 레벨: int):
