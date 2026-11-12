@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import io
 import logging
 import re
 from typing import Optional
@@ -21,6 +22,7 @@ import discord
 from discord import app_commands
 
 import activity
+import cards
 
 logger = logging.getLogger("Chris-bot.stars")
 
@@ -168,6 +170,22 @@ def star_rank(guild_id: int, total: int) -> int:
     ).fetchone()[0] + 1
 
 
+def top_works(guild_id: int, limit: int = PAGE_SIZE, offset: int = 0) -> list[tuple[int, int, int, int, Optional[int]]]:
+    """[(메시지 ID, 채널 ID, 작성자 ID, 별, 스타보드 글 ID 또는 None)] 별 많은 작품 순 (같으면 먼저 올라온 순)"""
+    return _conn().execute(
+        "SELECT m.message_id, m.channel_id, m.author_id, m.stars, b.board_message_id FROM star_messages m "
+        "LEFT JOIN star_board b ON b.message_id = m.message_id "
+        "WHERE m.guild_id = ? AND m.stars > 0 ORDER BY m.stars DESC, m.message_id LIMIT ? OFFSET ?",
+        (guild_id, limit, offset),
+    ).fetchall()
+
+
+def count_starred_works(guild_id: int) -> int:
+    return _conn().execute(
+        "SELECT COUNT(*) FROM star_messages WHERE guild_id = ? AND stars > 0", (guild_id,)
+    ).fetchone()[0]
+
+
 def replace_guild_stars(guild_id: int, rows: dict[int, tuple[int, int, int]], carl_posts: dict[int, int]) -> None:
     """
     가져오기 결과로 서버의 별 기록을 통째로 바꿉니다. 보정값도 초기화.
@@ -275,6 +293,19 @@ def plan_board(stars: int, threshold: int, entry: Optional[dict]) -> Optional[st
     if stars >= threshold:
         return "edit" if entry else "post"
     return "remove" if entry else None
+
+
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
+def format_work_line(rank: int, guild_id: int, message_id: int, channel_id: int, author_id: int,
+                     stars: int, board_message_id: Optional[int], board_channel_id: Optional[int] = None) -> str:
+    """작품 순위 한 줄: 순위 · 별 · 작성자 · 원본 바로가기 (+ 스타보드 글 바로가기 — 원본이 지워졌을 때 대비)"""
+    link = f"[작품 보기](https://discord.com/channels/{guild_id}/{channel_id}/{message_id})"
+    if board_message_id and board_channel_id:
+        link += f" · [스타보드](https://discord.com/channels/{guild_id}/{board_channel_id}/{board_message_id})"
+    date = discord.utils.snowflake_time(message_id).strftime("%Y-%m-%d")
+    return f"{MEDALS.get(rank, f'`{rank}.`')} {STAR} **{stars}** — <@{author_id}> · {date} · {link}"
 
 
 def board_content(stars: int, channel_id: int) -> str:
@@ -653,7 +684,7 @@ async def _send_chunks(interaction: discord.Interaction, text: str) -> None:
 def register(tree: app_commands.CommandTree) -> None:
     ensure_tables()
 
-    @tree.command(name="스타순위", description="스타보드 별(⭐)을 많이 받은 순위를 봅니다. 한 페이지에 10명씩.")
+    @tree.command(name="스타순위", description="별(⭐)을 많이 받은 사람 순위(이미지)를 봅니다. 한 페이지에 10명씩.")
     @app_commands.guild_only()
     @app_commands.describe(페이지="볼 페이지 (1페이지 = 1~10위)")
     async def star_ranking(interaction: discord.Interaction, 페이지: app_commands.Range[int, 1, 1000] = 1):
@@ -661,22 +692,64 @@ def register(tree: app_commands.CommandTree) -> None:
         if not _settings(gid).get("stars_imported"):
             await interaction.response.send_message("📋 아직 별 기록이 없습니다. 관리자가 `/스타관리 가져오기`를 먼저 실행해야 합니다.", ephemeral=True)
             return
+        await interaction.response.defer(thinking=True)
         total = count_star_users(gid)
         pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
         page = min(페이지, pages)
         rows = top_stars(gid, PAGE_SIZE, (page - 1) * PAGE_SIZE)
         if not rows:
-            await interaction.response.send_message("📋 아직 별 기록이 없습니다.", ephemeral=True)
+            await interaction.followup.send("📋 아직 별 기록이 없습니다.")
             return
-        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        lines = [
-            f"{medals.get(i, f'`{i}.`')} <@{uid}> — {STAR} **{stars:,}** (작품 {works:,}개)"
-            for i, (uid, stars, works) in enumerate(rows, start=(page - 1) * PAGE_SIZE + 1)
-        ]
-        await interaction.response.send_message(
-            f"### {STAR} 받은 별 순위 — {page} / {pages} 페이지\n" + "\n".join(lines),
-            allowed_mentions=discord.AllowedMentions.none(),
+        top = top_stars(gid, 1)[0][1]  # 막대 길이 = 1위 대비
+        found = await activity.resolve_users(interaction.guild, interaction.client, [r[0] for r in rows])
+        leader_rows = []
+        for i, (uid, got, works) in enumerate(rows, start=(page - 1) * PAGE_SIZE + 1):
+            who = found.get(uid)
+            grade = await activity._grade_badge(who, with_icon=False) if isinstance(who, discord.Member) else None
+            leader_rows.append(
+                cards.LeaderRow(
+                    rank=i,
+                    name=who.display_name if who else f"알 수 없음 ({uid})",
+                    avatar=await activity._avatar_bytes(who) if who else None,
+                    level=0,
+                    progress=got / top if top else 0,
+                    color=cards.grade_color(grade),
+                    label=f"별 {got:,} · 작품 {works:,}",
+                )
+            )
+        png = await asyncio.to_thread(cards.render_leaderboard, leader_rows)
+        await interaction.followup.send(
+            f"{STAR} **받은 별 순위** — {page} / {pages} 페이지",
+            file=discord.File(io.BytesIO(png), filename="stars.png"),
         )
+
+    @tree.command(name="스타작품순위", description="별(⭐)을 많이 받은 작품 순위를 봅니다. 작품 바로가기 링크 포함, 10개씩.")
+    @app_commands.guild_only()
+    @app_commands.describe(페이지="볼 페이지 (1페이지 = 1~10위)")
+    async def work_ranking(interaction: discord.Interaction, 페이지: app_commands.Range[int, 1, 1000] = 1):
+        gid = interaction.guild_id
+        if not _settings(gid).get("stars_imported"):
+            await interaction.response.send_message("📋 아직 별 기록이 없습니다. 관리자가 `/스타관리 가져오기`를 먼저 실행해야 합니다.", ephemeral=True)
+            return
+        total = count_starred_works(gid)
+        pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = min(페이지, pages)
+        rows = top_works(gid, PAGE_SIZE, (page - 1) * PAGE_SIZE)
+        if not rows:
+            await interaction.response.send_message("📋 아직 별 받은 작품이 없습니다.", ephemeral=True)
+            return
+        board_channel = _settings(gid).get("star_board_channel")
+        lines = [
+            format_work_line(i, gid, *row, board_channel_id=board_channel)
+            for i, row in enumerate(rows, start=(page - 1) * PAGE_SIZE + 1)
+        ]
+        # 링크가 길어 일반 메시지 2,000자를 넘을 수 있으므로 임베드(4,096자)에 담습니다.
+        embed = discord.Embed(
+            title=f"{STAR} 작품별 별 순위 — {page} / {pages} 페이지",
+            description="\n".join(lines),
+            color=BOARD_COLOR,
+        )
+        await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     admin = app_commands.Group(
         name="스타관리",

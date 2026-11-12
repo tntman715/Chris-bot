@@ -585,6 +585,29 @@ async def _member_badges(member: discord.Member, settings: dict) -> list[cards.B
     return badges
 
 
+async def resolve_users(
+    guild: discord.Guild, client: discord.Client, ids: list[int]
+) -> dict[int, Union[discord.Member, discord.User]]:
+    """순위표용: 서버 멤버로 찾고, 나간 사람은 유저 정보로라도 찾습니다."""
+    found: dict[int, Union[discord.Member, discord.User]] = {}
+    try:
+        for mem in await guild.query_members(user_ids=ids, limit=100, cache=True):
+            found[mem.id] = mem
+    except (asyncio.TimeoutError, discord.HTTPException) as e:
+        logger.warning(f"리더보드 멤버 조회 실패: {e}")
+    for uid in ids:
+        if uid not in found:
+            user = client.get_user(uid)
+            if user is None:
+                try:
+                    user = await client.fetch_user(uid)
+                except discord.HTTPException:
+                    user = None
+            if user is not None:
+                found[uid] = user
+    return found
+
+
 def _split_lines(text: str, limit: int = 1900) -> list[str]:
     chunks, current = [], ""
     for line in text.split("\n"):
@@ -728,23 +751,7 @@ def register(tree: app_commands.CommandTree) -> None:
             await interaction.followup.send("📋 아직 레벨 기록이 없습니다.")
             return
 
-        ids = [uid for uid, _ in rows]
-        found: dict[int, Union[discord.Member, discord.User]] = {}
-        try:
-            for mem in await guild.query_members(user_ids=ids, limit=100, cache=True):
-                found[mem.id] = mem
-        except (asyncio.TimeoutError, discord.HTTPException) as e:
-            logger.warning(f"리더보드 멤버 조회 실패: {e}")
-        for uid in ids:
-            if uid not in found:
-                user = interaction.client.get_user(uid)
-                if user is None:
-                    try:
-                        user = await interaction.client.fetch_user(uid)
-                    except discord.HTTPException:
-                        user = None
-                if user is not None:
-                    found[uid] = user
+        found = await resolve_users(guild, interaction.client, [uid for uid, _ in rows])
 
         leader_rows = []
         for i, (uid, xp) in enumerate(rows, start=offset + 1):

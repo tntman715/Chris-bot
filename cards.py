@@ -75,6 +75,7 @@ class LeaderRow:
     level: int
     progress: float  # 현재 레벨 안에서의 진행도 0~1
     color: tuple[int, int, int] = NO_GRADE  # 막대 색 = 등급 색 (등급 없으면 회색)
+    label: Optional[str] = None  # 오른쪽 글자 (없으면 "레벨 N") — 예: 별 순위의 "별 2,073 · 작품 183"
 
 
 # ---------------------------------------------------------------------
@@ -316,7 +317,7 @@ def render_leaderboard(rows: list[LeaderRow]) -> bytes:
         draw.text((x, cy), "•", font=font(22), fill=GRAY, anchor="lm")
         x += 20
 
-        level_text = f"레벨 {r.level}"
+        level_text = r.label or f"레벨 {r.level}"
         lw = int(draw.textlength(level_text, font=font(26)))
         name = fit(draw, clean(r.name), font(26), W - 24 - lw - 30 - x)
         draw.text((x, cy), name, font=font(26), fill=WHITE, anchor="lm")
