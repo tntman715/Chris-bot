@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import activity
 import bounty
 import stars
+import colors
 
 # .env 파일에서 환경변수 로드
 load_dotenv()
@@ -726,6 +727,8 @@ class ChrisBot(discord.Client):
     async def setup_hook(self):
         await self.tree.sync()
         logger.info("슬래시 명령어 동기화 완료")
+        # 부스트가 끝난 사람의 닉네임색 역할을 주기적으로 회수
+        self.loop.create_task(colors.boost_watch(self))
 
     async def on_ready(self):
         logger.info(f"로그인 성공: {self.user} (ID: {self.user.id})")
@@ -785,6 +788,7 @@ bot = ChrisBot()
 activity.register(bot.tree)
 bounty.register(bot.tree)
 stars.register(bot.tree)
+colors.register(bot.tree)
 
 
 # =====================================================================

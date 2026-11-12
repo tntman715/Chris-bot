@@ -113,7 +113,14 @@ ssh -i ~/.ssh/gfx_oracle -o BatchMode=yes ubuntu@161.33.0.94 "cd /opt/bots/Chris
    - **누가 누구에게 별을 줬는지** (`star_givers` 테이블, 본인 · 봇 제외): 실시간 add/remove/clear 때 함께 기록. 지난 기록은 `/스타관리 준사람가져오기`(별 받은 메시지마다 `http.get_reaction_users` 100명씩, 메시지 3천 개 ≈ 1시간, 원본 삭제는 건너뜀, `star_givers_imported`). 이것으로 `/스타정보 [유저]`(칼봇 stats처럼: 받은/준 별 · 순위, 별 많이 받은 작품 Top 3 링크, 나에게 별 많이 준 사람 · 내가 별 많이 준 사람 Top 3)와 `/스타순위 기준:준 별`(별을 가장 많이 준 사람 순위, 주인 요청 2026-11-12).
    - 옮기는 순서: `가져오기 #starboard` → `칼봇맞추기 #starboard-test` → 칼봇 스타보드 끄기 → `스타보드기능 켜기` → `자동별 켜기`.
 
-7. **긴 메시지 자동 분할 (공통)**
+7. **부스터 닉네임 색 (`colors.py`, 주인 요청 2026-11-13)**
+   - `/닉네임색 설정 [색] [그라데이션색]`: **서버 부스터만** (`member.premium_since` 또는 Server Booster 역할). 두 번째 색을 넣으면 그라데이션(역할 `secondary_colour`). 서버에 `ENHANCED_ROLE_COLORS` 기능이 없으면 두 번째 색은 거절 (2026-11-13 메인 서버는 부스트 8개 · 기능 열려 있음).
+   - 색 입력: 자동완성 색 이름 22개(`PRESETS`) 또는 헥스(`#FF8800` · `FF8800` · `#F80`), 순수 함수 `parse_color()`. 검정 0은 디스코드에서 '색 없음'이라 `0x010101`로.
+   - 역할: 색(1색/2색 조합)마다 하나 `🎨 #RRGGBB [→ #RRGGBB]`, 같은 색끼리 공유. 테이블 `color_roles(role_id, guild_id, color1, color2)` · `member_colors(guild_id, user_id, role_id)`. 아무도 안 쓰면 역할 삭제, 관리자가 손으로 지운 역할은 다시 만듦. 위치는 `Chris Bot` 역할 바로 아래 (2026-11-13: `Chris Bot`이 66번째로 등급 · Server Booster 역할보다 위, 그 위에는 Owner · Admin · People color · RaidProtect · carl-bot).
+   - `boost_watch()`: 30분마다 `member_colors`의 사람을 `fetch_member`로 확인해 부스트가 끝났거나 나간 사람의 색 역할 회수 (Server Members Intent 없이 동작).
+   - `/닉네임색 해제`, `/닉네임색 미리보기` (누구나, `cards.render_name_color` — 어두운 · 밝은 화면 미리보기 이미지).
+
+8. **긴 메시지 자동 분할 (공통)**
    - 디스코드 메시지 2,000자 제한 대응: `split_message()` / `send_long_ephemeral()` 헬퍼가 1,900자 단위로 줄을 나누어 보내며, ``` 코드블록 중간에서 잘리면 닫고 다음 메시지에서 다시 엶.
    - 적용 위치: `/등급관리 최종승인` 결과(공지 문구), `/등급관리 취합현황`, `/등급관리 설정목록`, `/포스트삭제채널 목록`, 아카이브 채널 기록.
    - 새로 긴 응답을 만드는 명령어도 `interaction.response.send_message` 대신 `send_long_ephemeral()`을 사용할 것.

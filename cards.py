@@ -42,7 +42,7 @@ NO_GRADE = (128, 133, 142)  # 등급이 없을 때의 강조색 (회색)
 MEDALS = {1: (245, 196, 66), 2: (190, 196, 205), 3: (205, 127, 50)}
 
 # 글꼴에 없는 이모지 등은 네모(□)로 나오므로 지웁니다.
-_UNSUPPORTED = re.compile("[\U00010000-\U0010FFFF\uFE0F\u200D\u20E3]")
+_UNSUPPORTED = re.compile("[\U00010000-\U0010FFFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\u20E3]")
 
 
 @dataclass
@@ -333,3 +333,46 @@ def render_leaderboard(rows: list[LeaderRow]) -> bytes:
     buf = io.BytesIO()
     out.save(buf, "PNG", optimize=True)  # 바깥은 투명하게 (디스코드 배경에 자연스럽게)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------
+# 닉네임 색 미리보기 (/닉네임색)
+# ---------------------------------------------------------------------
+NAME_PREVIEW_BGS = [(49, 51, 56), (255, 255, 255)]  # 디스코드 어두운 화면 · 밝은 화면
+
+
+def _hex_rgb(value: int) -> tuple[int, int, int]:
+    return (value >> 16) & 255, (value >> 8) & 255, value & 255
+
+
+def name_fill(width: int, height: int, color1: int, color2: Optional[int]) -> Image.Image:
+    """글자를 채울 색 (한 가지 색 또는 왼쪽 → 오른쪽 그라데이션)"""
+    c1 = _hex_rgb(color1)
+    if color2 is None:
+        return Image.new("RGB", (width, height), c1)
+    c2 = _hex_rgb(color2)
+    row = Image.new("RGB", (width, 1))
+    span = max(width - 1, 1)
+    row.putdata([tuple(round(a + (b - a) * x / span) for a, b in zip(c1, c2)) for x in range(width)])
+    return row.resize((width, height))
+
+
+def render_name_color(name: str, color1: int, color2: Optional[int] = None) -> bytes:
+    """닉네임을 그 색으로 어두운 배경 · 밝은 배경에 그려 봅니다."""
+    f = font(44)
+    probe = ImageDraw.Draw(Image.new("L", (1, 1)))
+    name = fit(probe, clean(name), f, 760)
+    left, top, right, bottom = probe.textbbox((0, 0), name, font=f)
+    tw, th = max(right - left, 1), max(bottom - top, 1)
+    pad_x, pad_y = 36, 26
+    width = max(tw + pad_x * 2, 420)
+    row_h = th + pad_y * 2
+    img = Image.new("RGB", (width, row_h * len(NAME_PREVIEW_BGS)))
+    mask = Image.new("L", (tw, th), 0)
+    ImageDraw.Draw(mask).text((-left, -top), name, font=f, fill=255)
+    fill = name_fill(tw, th, color1, color2)
+    for i, bg in enumerate(NAME_PREVIEW_BGS):
+        y = i * row_h
+        img.paste(bg, (0, y, width, y + row_h))
+        img.paste(fill, (pad_x, y + pad_y), mask)
+    return to_png(img)
