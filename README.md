@@ -1,7 +1,7 @@
 # Chris-bot (디스코드 서버 편의 기능 봇)
 
 디스코드 서버 운영 및 이용 편의를 위해 제작된 Python(`discord.py`) 기반 봇입니다.
-다른 AI 세션(Claude, Antigravity 등)에서 이어서 작업할 때는 이 문서와 [`CLAUDE.md`](./CLAUDE.md)를 먼저 읽고 규칙을 따라 주세요.
+다른 AI 세션(Claude, Antigravity 등)에서 이어서 작업할 때는 이 문서와 [`AGENTS.md`](./AGENTS.md)를 먼저 읽고 규칙을 따라 주세요.
 
 ---
 
@@ -68,4 +68,4 @@
 - **설치 경로**: `/opt/bots/Chris-bot`
 - **서비스 이름**: `bot-chris.service`
 - **런타임**: Python 3.12 (`.venv` 가상환경)
-- 자세한 서버 접속 및 배포 절차는 [`CLAUDE.md`](./CLAUDE.md)를 참고하세요.
+- 자세한 서버 접속 및 배포 절차는 [`AGENTS.md`](./AGENTS.md)를 참고하세요.
