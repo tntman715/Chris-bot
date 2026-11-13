@@ -465,25 +465,95 @@ async def _get_channel(guild: discord.Guild, channel_id: int):
     return channel
 
 
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+UPLOAD_MARGIN = 256 * 1024  # 한도에 딱 맞추지 않고 조금 여유를 둠
+
+
+def _is_image(att: discord.Attachment) -> bool:
+    return (att.content_type or "").startswith("image/") or att.filename.lower().endswith(IMAGE_EXTENSIONS)
+
+
+def shrink_image(data: bytes, limit: int) -> Optional[tuple[bytes, str]]:
+    """사진을 limit 바이트 아래로 줄입니다 → (데이터, 확장자). 못 줄이면 None.
+
+    봇은 서버 업로드 한도(부스트 1단계 10MB)보다 큰 파일을 못 올립니다. 4K PNG 썸네일은 이 한도를 넘기 쉬워서,
+    투명 부분이 없으면 고화질 JPEG로, 있으면 PNG 그대로 크기를 조금씩 줄여 한도 안에 맞춥니다.
+    움직이는 GIF · WebP는 줄이지 않습니다 (첫 장면만 남게 되므로).
+    """
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(data))
+        if getattr(img, "is_animated", False):
+            return None
+        img.load()
+        alpha = img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
+        if alpha:
+            img = img.convert("RGBA")
+            if img.getchannel("A").getextrema()[0] == 255:  # 투명 칸이 실제로는 없음
+                img, alpha = img.convert("RGB"), False
+        else:
+            img = img.convert("RGB")
+        scale = 1.0
+        for _ in range(12):
+            frame = img if scale == 1.0 else img.resize(
+                (max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS
+            )
+            out = io.BytesIO()
+            if alpha:
+                frame.save(out, "PNG", optimize=True)
+            else:
+                frame.save(out, "JPEG", quality=92, optimize=True)
+            if out.tell() <= limit:
+                return out.getvalue(), "png" if alpha else "jpg"
+            scale *= 0.85
+    except Exception:
+        logger.exception("스타보드 사진 줄이기 실패")
+    return None
+
+
+async def _media_file(att: discord.Attachment, limit: int) -> Optional[discord.File]:
+    """첨부를 다시 올릴 파일로 만듭니다. 한도를 넘는 사진은 줄여서, 줄일 수 없으면 None."""
+    if att.size <= limit:
+        return await att.to_file()
+    if not _is_image(att):
+        return None  # 큰 영상은 줄일 수 없음 → 원본 바로가기만
+    shrunk = await asyncio.to_thread(shrink_image, await att.read(), limit - UPLOAD_MARGIN)
+    if shrunk is None:
+        return None
+    data, ext = shrunk
+    stem = att.filename.rsplit(".", 1)[0] if "." in att.filename else att.filename
+    return discord.File(io.BytesIO(data), filename=f"{stem}.{ext}", spoiler=att.is_spoiler())
+
+
 async def _build_board_post(message: discord.Message, stars: int) -> tuple[str, discord.Embed, list[discord.File]]:
     embed = discord.Embed(description=(message.content or "")[:4000] or None, color=BOARD_COLOR, timestamp=message.created_at)
     embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
     embed.add_field(name="원본", value=f"[바로가기]({message.jump_url})")
     embed.set_footer(text=str(message.id))
     files: list[discord.File] = []
-    limit = message.guild.filesize_limit if message.guild else 8 * 1024 * 1024
-    # 사진 · 영상은 다시 올려서 붙입니다 (원본 링크는 시간이 지나면 만료될 수 있음)
+    limit = message.guild.filesize_limit if message.guild else 10 * 1024 * 1024
+    # 사진 · 영상은 다시 올려서 붙입니다 (원본 링크는 시간이 지나면 만료될 수 있음).
+    # 한도보다 큰 사진은 줄여서 올리고, 그것도 안 되면 원본 사진 링크를 그대로 씁니다.
+    fallback_url = None
     for att in message.attachments:
-        if not activity._is_media(att) or att.size > limit or files:
+        if not activity._is_media(att):
             continue
         try:
-            f = await att.to_file()
+            f = await _media_file(att, limit)
         except discord.HTTPException:
+            f = None
+        if f is None:
+            if fallback_url is None and _is_image(att):
+                fallback_url = att.url
             continue
         files.append(f)
-        if (att.content_type or "").startswith("image/") or att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+        if _is_image(att):
             embed.set_image(url=f"attachment://{f.filename}")
-    if not files:
+        break
+    if not files and fallback_url:
+        embed.set_image(url=fallback_url)
+    if not files and not fallback_url:
         for e in message.embeds:  # 링크 미리보기 이미지
             url = (e.image and e.image.url) or (e.thumbnail and e.thumbnail.url)
             if url:
