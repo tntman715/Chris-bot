@@ -6,10 +6,13 @@
 - /작품완료 : 신청자가 처리자 한 명을 고르면, 걸린 코인은 처리자의 기여 점수로 바뀝니다 (기본 10점 + 걸린 코인 × 2).
   처리자에게 코인은 가지 않고, 걸린 코인은 사라집니다 (주인 결정 2026-11-14 — 코인 환전도 없앰).
   처리자는 그 포스트에 사진 · 영상을 올린 사람 중에서만 고를 수 있습니다 (본인 제외).
+- /작품완료요청 : 신청자가 완료 처리를 잊었을 때, 작품을 올린 작업자가 신청자를 불러 [완료 처리] 버튼을 띄웁니다.
+  버튼은 신청자만 누를 수 있고, 누르면 그 작업자를 처리자로 확정하는 확인 창이 나옵니다 (봇을 다시 켜도 버튼 유지).
 - /작품취소 또는 포스트 삭제 시 걸린 코인을 신청자에게 돌려줍니다. 오래된 신청을 자동으로 정리하지는 않습니다.
 """
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -27,6 +30,8 @@ BASE_CONTRIBUTION = 10  # 작품을 처리하면 현상금과 상관없이 받�
 def contribution_points(amount: int) -> int:
     """처리자가 받는 기여 점수: 기본 10점 + 걸린 코인 × 2 (현상금 없는 작업은 10점)."""
     return BASE_CONTRIBUTION + amount * CONTRIBUTION_MULTIPLIER
+REQUEST_COOLDOWN_SECONDS = 6 * 60 * 60  # 같은 포스트에서 같은 작업자가 다시 요청하려면 6시간
+_last_request: dict[tuple[int, int], float] = {}  # (포스트 ID, 작업자 ID) → 마지막 요청 시각 (time.monotonic)
 HISTORY_SCAN_LIMIT = 3000  # 처리자 후보를 찾을 때 포스트에서 훑어볼 최대 메시지 수
 CUR = activity.CURRENCY_NAME
 EMOJI = activity.CURRENCY_EMOJI
@@ -225,6 +230,29 @@ async def media_posters(thread: discord.Thread, exclude_ids: set[int]) -> list[d
     return members
 
 
+async def has_posted_media(thread: discord.Thread, user_id: int) -> bool:
+    """이 사람이 포스트에 사진 · 영상을 올렸는지 (처리자 후보 조건과 같음)"""
+    async for msg in thread.history(limit=HISTORY_SCAN_LIMIT):
+        if msg.author.id == user_id and _message_has_media(msg):
+            return True
+    return False
+
+
+def request_wait_seconds(thread_id: int, user_id: int, now: Optional[float] = None) -> int:
+    """완료 요청을 다시 보내려면 남은 시간(초). 0이면 지금 보낼 수 있음."""
+    last = _last_request.get((thread_id, user_id))
+    if last is None:
+        return 0
+    left = REQUEST_COOLDOWN_SECONDS - ((now if now is not None else time.monotonic()) - last)
+    return max(0, int(left))
+
+
+def reward_text(amount: int) -> str:
+    if amount:
+        return f"현상금 **{amount} {CUR}**이 기여 점수로 바뀌어 기여 점수 **{contribution_points(amount)}점**을 받습니다."
+    return f"걸린 {CUR}이 없어 기본 기여 점수 **{contribution_points(0)}점**을 받습니다."
+
+
 async def _announce_completion(thread: discord.Thread, solver: discord.abc.User, coins: int, points: int, by_admin: bool):
     if coins:
         text = (
@@ -280,15 +308,65 @@ class SolverSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         solver = self.candidates[int(self.values[0])]
-        reward = (
-            f"현상금 **{self.amount} {CUR}**이 기여 점수로 바뀌어 기여 점수 **{contribution_points(self.amount)}점**을 받습니다."
-            if self.amount
-            else f"걸린 {CUR}이 없어 기본 기여 점수 **{contribution_points(0)}점**을 받습니다."
-        )
+        reward = reward_text(self.amount)
         await interaction.response.edit_message(
             content=f"**{solver.mention}님**을 처리자로 확정할까요? {reward}\n*(확정하면 되돌릴 수 없습니다)*",
             view=ConfirmSolverView(self.thread, solver),
         )
+
+
+class CompletionRequestButton(discord.ui.DynamicItem[discord.ui.Button], template=r"bounty:done-request:(?P<solver>[0-9]+)"):
+    """/작품완료요청 으로 올라가는 [완료 처리] 버튼. 신청자만 누를 수 있음.
+    custom_id에 작업자 ID를 담아 두어, 봇을 다시 켜도 버튼이 계속 동작함 (register()에서 add_dynamic_items로 등록)."""
+
+    def __init__(self, solver_id: int):
+        super().__init__(discord.ui.Button(
+            label="완료 처리", style=discord.ButtonStyle.success, emoji="✅",
+            custom_id=f"bounty:done-request:{solver_id}",
+        ))
+        self.solver_id = solver_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match):
+        return cls(int(match["solver"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        thread = _request_thread(interaction.channel)
+        if thread is None:
+            await interaction.response.send_message("ℹ️ 더 이상 작품신청 포스트가 아닙니다.", ephemeral=True)
+            return
+        if interaction.user.id != thread.owner_id:
+            await interaction.response.send_message(
+                "❌ 이 버튼은 **신청자 본인**만 누를 수 있습니다.", ephemeral=True
+            )
+            return
+        req = get_or_create_request(thread)
+        if req["status"] != "open":
+            await interaction.response.send_message(
+                "ℹ️ 이미 처리가 끝났거나 취소된 신청입니다.", ephemeral=True
+            )
+            return
+        solver = thread.guild.get_member(self.solver_id)
+        if solver is None:
+            try:
+                solver = await thread.guild.fetch_member(self.solver_id)
+            except discord.HTTPException:
+                await interaction.response.send_message(
+                    "❌ 요청한 작업자가 서버에 없습니다. 다른 사람이 처리했다면 `/작품완료`를 사용해 주세요.", ephemeral=True
+                )
+                return
+        await interaction.response.send_message(
+            f"**{solver.mention}님**을 처리자로 확정할까요? {reward_text(req['amount'])}\n"
+            "*(확정하면 되돌릴 수 없습니다. 다른 사람이 작품을 줬다면 `취소`를 누르고 `/작품완료`로 골라 주세요)*",
+            view=ConfirmSolverView(thread, solver),
+            ephemeral=True,
+        )
+
+
+class CompletionRequestView(discord.ui.View):
+    def __init__(self, solver_id: int):
+        super().__init__(timeout=None)
+        self.add_item(CompletionRequestButton(solver_id))
 
 
 class SolverSelectView(discord.ui.View):
@@ -312,6 +390,7 @@ async def handle_thread_delete(payload: discord.RawThreadDeleteEvent) -> None:
 # =====================================================================
 def register(tree: app_commands.CommandTree) -> None:
     ensure_tables()
+    tree.client.add_dynamic_items(CompletionRequestButton)  # 봇을 다시 켜도 [완료 처리] 버튼 동작
 
     async def _require_request_thread(interaction: discord.Interaction) -> Optional[discord.Thread]:
         thread = _request_thread(interaction.channel)
@@ -346,6 +425,51 @@ def register(tree: app_commands.CommandTree) -> None:
             f"*(현재 총 현상금: **{total} {CUR}** {EMOJI})*",
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    @tree.command(name="작품완료요청", description="[작업자용] 작품을 줬는데 신청자가 완료 처리를 안 했으면, 신청자에게 완료를 요청합니다.")
+    @app_commands.guild_only()
+    async def request_completion(interaction: discord.Interaction):
+        thread = await _require_request_thread(interaction)
+        if thread is None:
+            return
+        if thread.owner_id == interaction.user.id:
+            await interaction.response.send_message(
+                "ℹ️ 신청자 본인은 `/작품완료`로 바로 완료할 수 있습니다.", ephemeral=True
+            )
+            return
+        req = get_or_create_request(thread)
+        if req["status"] != "open":
+            await interaction.response.send_message("ℹ️ 이미 처리가 끝났거나 취소된 신청입니다.", ephemeral=True)
+            return
+        wait = request_wait_seconds(thread.id, interaction.user.id)
+        if wait:
+            await interaction.response.send_message(
+                f"⏳ 이 포스트에는 이미 완료 요청을 보냈습니다. **{wait // 3600}시간 {wait % 3600 // 60}분** 뒤에 다시 보낼 수 있어요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await has_posted_media(thread, interaction.user.id):
+            await interaction.followup.send(
+                "❌ 이 포스트에 **내가 올린 사진 · 영상**이 없습니다. 완성작을 먼저 올린 뒤 요청해 주세요.", ephemeral=True
+            )
+            return
+        _last_request[(thread.id, interaction.user.id)] = time.monotonic()
+        try:
+            await thread.send(
+                f"📮 <@{thread.owner_id}>님, {interaction.user.mention}님이 작품을 완성했다고 **완료 처리**를 요청했습니다.\n"
+                f"받은 작품이 마음에 드시면 아래 **[완료 처리]** 버튼을 눌러 주세요. "
+                f"완료하면 작업자가 기여 점수 **{contribution_points(req['amount'])}점**을 받습니다"
+                + (f" *(걸린 현상금 {req['amount']} {CUR} 포함)*" if req['amount'] else "") + ".\n"
+                "*(다른 사람이 작품을 줬다면 `/작품완료`로 직접 골라 주세요)*",
+                view=CompletionRequestView(interaction.user.id),
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(thread.owner_id)]),
+            )
+        except discord.HTTPException as e:
+            _last_request.pop((thread.id, interaction.user.id), None)
+            await interaction.followup.send(f"❌ 요청 메시지를 올리지 못했습니다: {e}", ephemeral=True)
+            return
+        await interaction.followup.send("✅ 신청자에게 완료 처리를 요청했습니다.", ephemeral=True)
 
     @tree.command(name="작품완료", description="작품을 받았으면 처리자를 골라 완료합니다. (포스트에 사진·영상을 올린 사람 중에서)")
     @app_commands.guild_only()
