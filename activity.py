@@ -63,9 +63,7 @@ DEFAULT_SETTINGS = {
     "work_channels": [],  # 작업물 채널 — 사진·영상을 올리면 경험치 보너스 (스레드는 상위 채널 기준)
     "request_channels": [],  # 작품신청 포럼 채널 (bounty.py 현상금 시스템)
     "linked_guilds": [],  # 연동 서버 ID — 그 서버들의 채팅 · 반응도 이 서버(메인)의 레벨 · 코인에 합산
-    "coin_xp_rate": 10,  # /코인환전: 코인 1개당 경험치 (0이면 환전 끔)
 }
-DEFAULT_COIN_XP_RATE = 10
 
 
 # =====================================================================
@@ -197,19 +195,6 @@ class ActivityDB:
                 for linked in json.loads(data).get("linked_guilds", []):
                     self._home_cache[int(linked)] = gid
         return self._home_cache.get(guild_id, guild_id)
-
-    def exchange_coins(self, guild_id: int, user_id: int, coins: int, xp_per_coin: int) -> Optional[tuple[int, int, int]]:
-        """코인을 경험치로 바꿉니다. 코인이 모자라면 None, 아니면 (남은 코인, 이전 경험치, 새 경험치)"""
-        m = self.get_member(guild_id, user_id)
-        if coins <= 0 or m["coins"] < coins:
-            return None
-        gain = coins * xp_per_coin
-        self.conn.execute(
-            "UPDATE members SET coins = coins - ?, xp = xp + ? WHERE guild_id = ? AND user_id = ?",
-            (coins, gain, guild_id, user_id),
-        )
-        self.conn.commit()
-        return m["coins"] - coins, m["xp"], m["xp"] + gain
 
     # ---------------- 활동 기록 ----------------
     def record_message(
@@ -884,36 +869,6 @@ def register(tree: app_commands.CommandTree) -> None:
             file=discord.File(io.BytesIO(png), filename="leaderboard.png"),
         )
 
-    @tree.command(name="코인환전", description=f"{CURRENCY_NAME}을 경험치로 바꿉니다.")
-    @app_commands.guild_only()
-    @app_commands.describe(코인=f"경험치로 바꿀 {CURRENCY_NAME} 수")
-    async def exchange(interaction: discord.Interaction, 코인: app_commands.Range[int, 1, 1_000_000]):
-        database = get_db()
-        gid = database.home_guild(interaction.guild_id)
-        settings = database.get_settings(gid)
-        rate = int(settings.get("coin_xp_rate", DEFAULT_COIN_XP_RATE) or 0)
-        if rate <= 0:
-            await interaction.response.send_message(f"❌ 지금은 {CURRENCY_NAME} 환전이 꺼져 있습니다.", ephemeral=True)
-            return
-        result = database.exchange_coins(gid, interaction.user.id, 코인, rate)
-        if result is None:
-            balance = database.get_member(gid, interaction.user.id)["coins"]
-            await interaction.response.send_message(
-                f"❌ {CURRENCY_NAME}이 부족합니다. *(보유: {balance} {CURRENCY_EMOJI}, 바꾸려는 양: {코인})*",
-                ephemeral=True,
-            )
-            return
-        left, old_xp, new_xp = result
-        level, cur, need = level_progress(new_xp)
-        await interaction.response.send_message(
-            f"✅ {코인} {CURRENCY_EMOJI} → **{코인 * rate:,} XP**로 바꿨습니다. "
-            f"*({CURRENCY_NAME} 1개 = {rate} XP, 남은 {CURRENCY_NAME}: {left} {CURRENCY_EMOJI})*\n"
-            f"- **레벨 {level}** `{_progress_bar(cur, need)}` {cur} / {need} XP",
-            ephemeral=True,
-        )
-        if level > level_from_xp(old_xp) and settings.get("live") and isinstance(interaction.user, discord.Member):
-            await level_up(interaction.client, interaction.channel, interaction.user, gid, level, settings)
-
     admin = app_commands.Group(
         name="레벨관리",
         description="[관리자용] 레벨 · 활동량 · 코인 시스템을 설정합니다.",
@@ -1162,7 +1117,6 @@ def register(tree: app_commands.CommandTree) -> None:
             (interaction.client.get_guild(int(g)).name if interaction.client.get_guild(int(g)) else str(g))
             for g in s.get("linked_guilds", [])
         ) or "없음"
-        rate = int(s.get("coin_xp_rate", DEFAULT_COIN_XP_RATE) or 0)
         live = "🟢 켜짐" if s.get("live") else "⚪ 꺼짐 (경험치·코인은 적립 중)"
         announce = f"<#{s['announce_channel_id']}>" if s.get("announce_channel_id") else "채팅한 채널"
         excluded = ", ".join(f"<#{c}>" for c in s.get("excluded_channels", [])) or "없음"
@@ -1175,7 +1129,6 @@ def register(tree: app_commands.CommandTree) -> None:
             + linked_note +
             f"- **레벨업 알림 · 역할 지급**: {live}\n"
             f"- **연동 서버** (활동 합산): {linked_names}\n"
-            f"- **코인 환전** (`/코인환전`): {f'{CURRENCY_NAME} 1개 = {rate} XP' if rate else '꺼짐'}\n"
             f"- **레벨업 알림 채널**: {announce}\n"
             f"- **활동량 제외 채널**: {excluded}\n"
             f"- **작업물 채널** (사진·영상 경험치 보너스): {work}\n"
@@ -1290,19 +1243,6 @@ def register(tree: app_commands.CommandTree) -> None:
         )
         return False
 
-    @admin.command(name="환전비율", description=f"/코인환전: {CURRENCY_NAME} 1개를 경험치 몇으로 바꿀지 정합니다. (0 = 환전 끔)")
-    @app_commands.describe(경험치=f"{CURRENCY_NAME} 1개당 경험치 (기본 {DEFAULT_COIN_XP_RATE}, 0이면 환전 끔)")
-    async def set_exchange_rate(interaction: discord.Interaction, 경험치: app_commands.Range[int, 0, 1000]):
-        if not await _main_only(interaction):
-            return
-        database = get_db()
-        s = database.get_settings(interaction.guild_id)
-        s["coin_xp_rate"] = 경험치
-        database.save_settings(interaction.guild_id, s)
-        text = (f"✅ 이제 {CURRENCY_NAME} 1개 = **{경험치} XP**로 바꿀 수 있습니다." if 경험치
-                else f"✅ {CURRENCY_NAME} 환전을 껐습니다.")
-        await interaction.response.send_message(text, ephemeral=True)
-
     async def _guild_choices(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
         cur = (current or "").lower()
         out = []
@@ -1358,7 +1298,7 @@ def register(tree: app_commands.CommandTree) -> None:
             f"- 이제 그 서버의 채팅 · 반응도 **이 서버의 레벨 · {CURRENCY_NAME} · 순위**에 합산됩니다. "
             "쿨다운도 두 서버를 통틀어 하나로 셉니다.\n"
             "- 레벨업 알림 · 레벨 역할은 이 서버 기준입니다. (이 서버에 없는 사람은 그 서버 채널에 알림만)\n"
-            f"- 그 서버에서 `/랭크` `/활동량` `/순위` `/리더보드` `/코인환전`을 써도 이 서버 기록이 나옵니다.\n"
+            f"- 그 서버에서 `/랭크` `/활동량` `/순위` `/리더보드`를 써도 이 서버 기록이 나옵니다.\n"
             "- 제외 채널 · 작업물 채널은 그 서버에서 `/레벨관리 제외채널추가` 등으로 따로 정합니다." + note,
             ephemeral=True,
         )

@@ -3,7 +3,8 @@
 
 - 관리자가 작품신청 포럼 채널을 정하면, 그 안의 포스트(스레드)가 신청 하나입니다. 신청은 무료.
 - 신청자(포스트 작성자)는 /현상금 으로 코인을 걸 수 있고, 건 코인은 완료 · 취소 때까지 봇이 맡아 둡니다.
-- /작품완료 : 신청자가 처리자 한 명을 고르면, 처리자는 걸린 코인 전부 + 기여 점수(기본 10점 + 걸린 코인 × 2)를 받습니다.
+- /작품완료 : 신청자가 처리자 한 명을 고르면, 걸린 코인은 처리자의 기여 점수로 바뀝니다 (기본 10점 + 걸린 코인 × 2).
+  처리자에게 코인은 가지 않고, 걸린 코인은 사라집니다 (주인 결정 2026-11-14 — 코인 환전도 없앰).
   처리자는 그 포스트에 사진 · 영상을 올린 사람 중에서만 고를 수 있습니다 (본인 제외).
 - /작품취소 또는 포스트 삭제 시 걸린 코인을 신청자에게 돌려줍니다. 오래된 신청을 자동으로 정리하지는 않습니다.
 """
@@ -120,7 +121,8 @@ def add_bounty(thread: discord.Thread, requester_id: int, amount: int) -> tuple[
 
 
 def complete_request(thread_id: int, guild_id: int, solver_id: int) -> Optional[tuple[int, int]]:
-    """처리 완료: (처리자가 받은 코인, 받은 기여 점수). 이미 끝난 신청이면 None."""
+    """처리 완료: (기여 점수로 바뀐 코인, 처리자가 받은 기여 점수). 이미 끝난 신청이면 None.
+    걸린 코인은 처리자에게 가지 않고 기여 점수로 바뀝니다."""
     conn = _conn()
     req = get_request(thread_id)
     if req is None or req["status"] != "open":
@@ -132,10 +134,9 @@ def complete_request(thread_id: int, guild_id: int, solver_id: int) -> Optional[
         (solver_id, _now(), thread_id),
     )
     conn.execute(
-        "INSERT INTO members (guild_id, user_id, coins, contribution) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(guild_id, user_id) DO UPDATE SET coins = coins + excluded.coins, "
-        "contribution = contribution + excluded.contribution",
-        (guild_id, solver_id, amount, points),
+        "INSERT INTO members (guild_id, user_id, contribution) VALUES (?, ?, ?) "
+        "ON CONFLICT(guild_id, user_id) DO UPDATE SET contribution = contribution + excluded.contribution",
+        (guild_id, solver_id, points),
     )
     if points:
         conn.execute(
@@ -227,8 +228,8 @@ async def media_posters(thread: discord.Thread, exclude_ids: set[int]) -> list[d
 async def _announce_completion(thread: discord.Thread, solver: discord.abc.User, coins: int, points: int, by_admin: bool):
     if coins:
         text = (
-            f"✅ **작품 처리 완료!** 처리자 {solver.mention}님이 현상금 **{coins} {CUR}** {EMOJI}과 "
-            f"기여 점수 **{points}점**을 받았습니다."
+            f"✅ **작품 처리 완료!** 현상금 **{coins} {CUR}** {EMOJI}이 기여 점수로 바뀌어, "
+            f"처리자 {solver.mention}님이 기여 점수 **{points}점**을 받았습니다."
         )
     else:
         text = f"✅ **작품 처리 완료!** 처리자 {solver.mention}님이 기여 점수 **{points}점**을 받았습니다. *(걸린 {CUR} 없음)*"
@@ -280,9 +281,9 @@ class SolverSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         solver = self.candidates[int(self.values[0])]
         reward = (
-            f"현상금 **{self.amount} {CUR}**과 기여 점수 **{contribution_points(self.amount)}점**을 받습니다."
+            f"현상금 **{self.amount} {CUR}**이 기여 점수로 바뀌어 기여 점수 **{contribution_points(self.amount)}점**을 받습니다."
             if self.amount
-            else f"걸린 {CUR}이 없어 기여 점수 **{contribution_points(0)}점**만 받습니다."
+            else f"걸린 {CUR}이 없어 기본 기여 점수 **{contribution_points(0)}점**을 받습니다."
         )
         await interaction.response.edit_message(
             content=f"**{solver.mention}님**을 처리자로 확정할까요? {reward}\n*(확정하면 되돌릴 수 없습니다)*",
@@ -320,7 +321,7 @@ def register(tree: app_commands.CommandTree) -> None:
             )
         return thread
 
-    @tree.command(name="현상금", description=f"내 작품신청 포스트에 {CUR}을 겁니다. 처리해 준 사람에게 전부 지급됩니다.")
+    @tree.command(name="현상금", description=f"내 작품신청 포스트에 {CUR}을 겁니다. 처리해 준 사람의 기여 점수로 바뀝니다.")
     @app_commands.guild_only()
     @app_commands.describe(코인=f"걸 {CUR} 수 (내 {CUR}에서 바로 빠지고, 취소하면 돌려받습니다)")
     async def put_bounty(interaction: discord.Interaction, 코인: app_commands.Range[int, 1, 1_000_000]):
