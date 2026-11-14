@@ -15,6 +15,7 @@ import bounty
 import stars
 import colors
 import keeproles
+import i18n
 
 # .env 파일에서 환경변수 로드
 load_dotenv()
@@ -748,6 +749,8 @@ class ChrisBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        # 한국어 앱이 아닌 사람에게는 명령어 이름 · 설명을 영어로 보여 줌 (i18n.py)
+        await self.tree.set_translator(i18n.EnglishTranslator())
         await self.tree.sync()
         logger.info("슬래시 명령어 동기화 완료")
         # 부스트가 끝난 사람의 닉네임색 역할을 주기적으로 회수

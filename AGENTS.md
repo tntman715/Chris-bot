@@ -130,7 +130,12 @@ ssh -i ~/.ssh/gfx_oracle -o BatchMode=yes ubuntu@161.33.0.94 "cd /opt/bots/Chris
    - 돌려줄 역할은 순수 함수 `restorable_roles()`: @everyone · managed(Server Booster · 봇 역할) · 크리스봇 최상위 역할 이상 · 닉네임색 역할(`colors.color_role_ids`) · 제외 역할 · 이미 가진 역할 · 없어진 역할 제외.
    - `/역할유지 기능·제외추가·제외제거·설정` (`manage_roles` 권한).
 
-9. **긴 메시지 자동 분할 (공통)**
+9. **영어 명령어 (`i18n.py`, 주인 요청 2026-11-14 — 외국인 멤버용)**
+   - 디스코드 localization: `bot.py` `setup_hook`에서 `tree.set_translator(i18n.EnglishTranslator())` → 한국어(`ko`)가 아닌 모든 언어에 영어 이름 · 설명 · 선택지를 붙여 sync. 기본(코드상) 이름은 한국어 그대로라 한국어 앱 사용자는 변화 없음, 실행되는 명령어도 같음.
+   - 표: `NAMES`(명령어 · 그룹 · 옵션 이름 — `^[-_a-z0-9]{1,32}$`, 형제끼리 중복 금지), `NAME_OVERRIDES`(같은 한국어인데 영어가 달라야 하는 자리, 전체 경로 키: `스타관리 기준`→`threshold`, `역할유지 설정`→`settings`), `TEXT`(설명 · 선택지, 100자 이하).
+   - **새 명령어 · 옵션 · 선택지를 추가하면 `i18n.py`에도 영어를 추가할 것.** 빠지면 그 부분만 한국어로 보임. 봇 답장 문구는 아직 한국어. 자동완성 목록(닉네임색 색 이름 등)도 한국어.
+
+10. **긴 메시지 자동 분할 (공통)**
    - 디스코드 메시지 2,000자 제한 대응: `split_message()` / `send_long_ephemeral()` 헬퍼가 1,900자 단위로 줄을 나누어 보내며, ``` 코드블록 중간에서 잘리면 닫고 다음 메시지에서 다시 엶.
    - 적용 위치: `/등급관리 최종승인` 결과(공지 문구), `/등급관리 취합현황`, `/등급관리 설정목록`, `/포스트삭제채널 목록`, 아카이브 채널 기록.
    - 새로 긴 응답을 만드는 명령어도 `interaction.response.send_message` 대신 `send_long_ephemeral()`을 사용할 것.
