@@ -14,6 +14,7 @@ import activity
 import bounty
 import stars
 import colors
+import keeproles
 
 # .env 파일에서 환경변수 로드
 load_dotenv()
@@ -715,12 +716,34 @@ class SelfStripGradeView(discord.ui.View):
 # =====================================================================
 # 봇 클라이언트 정의
 # =====================================================================
+def members_intent_enabled(token: Optional[str]) -> bool:
+    """개발자 포털에서 Server Members Intent가 켜져 있는지 확인합니다.
+    켜져 있지 않은데 요청하면 디스코드가 접속을 거부하므로, 꺼져 있으면 그 인텐트 없이 접속합니다 (역할 유지만 쉼)."""
+    if not token:
+        return False
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            "https://discord.com/api/v10/applications/@me",
+            headers={"Authorization": f"Bot {token}", "User-Agent": "DiscordBot (Chris-bot, 1)"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            flags = json.load(r).get("flags", 0)
+    except Exception as e:
+        logger.warning(f"Server Members Intent 확인 실패 — 이 인텐트 없이 접속합니다: {e}")
+        return False
+    return bool(flags & ((1 << 14) | (1 << 15)))  # GATEWAY_GUILD_MEMBERS / _LIMITED
+
+
 class ChrisBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         # 활동량 감지(글 길이 · 사진/영상 첨부 여부)에 필요합니다.
         # 디스코드 개발자 포털 → Bot → "Message Content Intent"도 켜져 있어야 합니다.
         intents.message_content = True
+        # 역할 유지(keeproles.py)에 필요합니다. 포털의 "Server Members Intent"가 켜져 있을 때만 씁니다.
+        intents.members = keeproles.members_intent_ok = members_intent_enabled(os.getenv("DISCORD_TOKEN"))
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -732,6 +755,29 @@ class ChrisBot(discord.Client):
 
     async def on_ready(self):
         logger.info(f"로그인 성공: {self.user} (ID: {self.user.id})")
+        logger.info(f"Server Members Intent: {'켜짐' if keeproles.members_intent_ok else '꺼짐 (역할 유지 쉼)'}")
+        try:
+            await keeproles.sync_all(self)
+        except Exception:
+            logger.exception("역할 유지 전체 저장 중 오류")
+
+    async def on_member_join(self, member: discord.Member):
+        try:
+            await keeproles.handle_join(member)
+        except Exception:
+            logger.exception("역할 유지: 역할 돌려주기 중 오류")
+
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        try:
+            keeproles.handle_update(before, after)
+        except Exception:
+            logger.exception("역할 유지: 역할 저장 중 오류")
+
+    async def on_raw_member_remove(self, payload: discord.RawMemberRemoveEvent):
+        try:
+            keeproles.handle_remove(payload)
+        except Exception:
+            logger.exception("역할 유지: 나간 멤버 역할 저장 중 오류")
 
     async def on_message(self, message: discord.Message):
         try:
@@ -789,6 +835,7 @@ activity.register(bot.tree)
 bounty.register(bot.tree)
 stars.register(bot.tree)
 colors.register(bot.tree)
+keeproles.register(bot.tree)
 
 
 # =====================================================================

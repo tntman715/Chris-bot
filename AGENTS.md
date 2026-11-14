@@ -122,7 +122,14 @@ ssh -i ~/.ssh/gfx_oracle -o BatchMode=yes ubuntu@161.33.0.94 "cd /opt/bots/Chris
    - `boost_watch()`: 30분마다 `member_colors`의 사람을 `fetch_member`로 확인해 부스트가 끝났거나 나간 사람의 색 역할 회수 (Server Members Intent 없이 동작).
    - `/닉네임색 해제`, `/닉네임색 미리보기` (누구나, `cards.render_name_color` — 어두운 · 밝은 화면 미리보기 이미지).
 
-8. **긴 메시지 자동 분할 (공통)**
+8. **역할 유지 (`keeproles.py`, 주인 요청 2026-11-14)**
+   - 서버를 나갔다 다시 들어온 사람에게 나가기 직전 역할을 돌려줌 (디스코드는 나가면 역할을 다 지움). 서버별 `guild_settings.keep_roles`(기본 꺼짐) · `keep_roles_excluded`. 레벨 · 코인 · 별 기록은 원래 유저 ID 기준이라 이 기능과 무관하게 유지됨 (Arcane은 나가면 초기화됐음).
+   - **Server Members Intent 필요**: `bot.py`의 `members_intent_enabled()`가 시작할 때 `GET /applications/@me`의 `flags`(1<<14 · 1<<15)로 포털 설정을 확인해 켜져 있을 때만 `intents.members = True` (꺼진 채 요청하면 접속 거부되므로). 결과는 `keeproles.members_intent_ok` — False면 기능만 쉼. 이 인텐트가 켜지면 시작할 때 멤버 목록을 받아 캐시함(chunk).
+   - 테이블 `kept_roles(guild_id, user_id, role_ids JSON, updated_at)`. 저장: `on_member_update`(역할 바뀔 때) · `on_raw_member_remove`(캐시된 Member면) · `sync_guild`(on_ready · 기능 켤 때 서버 전체). 돌려주기: `on_member_join`(다른 봇이 역할을 주기 전에 기록부터 읽음), 그리고 `sync_guild`에서 `joined_at`이 기록 시각보다 나중인 사람(봇이 꺼진 동안 나갔다 들어옴).
+   - 돌려줄 역할은 순수 함수 `restorable_roles()`: @everyone · managed(Server Booster · 봇 역할) · 크리스봇 최상위 역할 이상 · 닉네임색 역할(`colors.color_role_ids`) · 제외 역할 · 이미 가진 역할 · 없어진 역할 제외.
+   - `/역할유지 기능·제외추가·제외제거·설정` (`manage_roles` 권한).
+
+9. **긴 메시지 자동 분할 (공통)**
    - 디스코드 메시지 2,000자 제한 대응: `split_message()` / `send_long_ephemeral()` 헬퍼가 1,900자 단위로 줄을 나누어 보내며, ``` 코드블록 중간에서 잘리면 닫고 다음 메시지에서 다시 엶.
    - 적용 위치: `/등급관리 최종승인` 결과(공지 문구), `/등급관리 취합현황`, `/등급관리 설정목록`, `/포스트삭제채널 목록`, 아카이브 채널 기록.
    - 새로 긴 응답을 만드는 명령어도 `interaction.response.send_message` 대신 `send_long_ephemeral()`을 사용할 것.
