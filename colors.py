@@ -236,8 +236,10 @@ def color_role_ids(guild_id: int) -> set[int]:
 
 def plan_positions(roles: list[tuple[int, int]], color_ids: set[int], bot_role_ids: set[int]) -> Optional[dict[int, int]]:
     """색 역할들을 크리스봇의 가장 높은 역할 바로 아래로 모으는 새 위치 {역할 ID: 위치} (바뀌는 것만).
-    roles = [(역할 ID, 지금 위치)] (@everyone 제외). 옮길 수 없으면 None.
-    디스코드는 위치가 같으면 ID가 큰(새) 역할을 아래로 봅니다."""
+    roles = [(역할 ID, 지금 위치)] (@everyone 제외). 크리스봇 역할이 없으면 None.
+    디스코드는 위치가 같으면 ID가 큰(새) 역할을 아래로 봅니다.
+    새로 만든 역할은 디스코드가 다른 역할과 같은 위치 1번에 넣어 번호가 모자랄 수 있는데,
+    그때는 맨 아래 역할들이 1번을 나눠 쓰게 해서 색 역할이 크리스봇 역할 바로 아래에 오게 합니다."""
     order = sorted(roles, key=lambda r: (r[1], -r[0]))  # 아래 → 위
     tops = [i for i, (rid, _) in enumerate(order) if rid in bot_role_ids]
     if not tops:
@@ -246,10 +248,25 @@ def plan_positions(roles: list[tuple[int, int]], color_ids: set[int], bot_role_i
     bot_position = order[top][1]
     below = [rid for rid, _ in order[:top]]
     new = [rid for rid in below if rid not in color_ids] + [rid for rid in below if rid in color_ids]
-    if len(new) >= bot_position:  # 위치 번호가 겹쳐 있어 크리스봇 역할 아래에 다 못 넣음
-        return None
+    extra = max(0, len(new) - (bot_position - 1))  # 겹친 번호 때문에 모자라는 자리 수
+
+    # 아래부터 번호를 매기며, 바로 아래 역할과 번호를 같이 써도 순서가 그대로인 곳(아래 역할 ID가 더 큼)에서
+    # 모자라는 만큼 번호를 나눠 씀. 그런 곳이 모자라면 맨 아래 역할들이 1번을 나눠 씀.
+    positions: list[int] = []
+    shares = extra
+    for i, rid in enumerate(new):
+        if i == 0:
+            positions.append(1)
+        elif shares and new[i - 1] > rid:
+            positions.append(positions[-1])
+            shares -= 1
+        else:
+            positions.append(positions[-1] + 1)
+    if shares:
+        positions = [max(1, i + 1 - extra) for i in range(len(new))]
+
     now = dict(roles)
-    return {rid: i + 1 for i, rid in enumerate(new) if now[rid] != i + 1}
+    return {rid: pos for rid, pos in zip(new, positions) if now[rid] != pos}
 
 
 async def arrange_roles(guild: discord.Guild) -> dict[int, int]:
