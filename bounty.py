@@ -3,7 +3,7 @@
 
 - 관리자가 작품신청 포럼 채널을 정하면, 그 안의 포스트(스레드)가 신청 하나입니다. 신청은 무료.
 - 신청자(포스트 작성자)는 /현상금 으로 코인을 걸 수 있고, 건 코인은 완료 · 취소 때까지 봇이 맡아 둡니다.
-- /작품완료 : 신청자가 처리자 한 명을 고르면, 처리자는 걸린 코인 전부 + 기여 점수(걸린 코인 × 2)를 받습니다.
+- /작품완료 : 신청자가 처리자 한 명을 고르면, 처리자는 걸린 코인 전부 + 기여 점수(걸린 코인 × 2, 최소 10점)를 받습니다.
   처리자는 그 포스트에 사진 · 영상을 올린 사람 중에서만 고를 수 있습니다 (본인 제외).
 - /작품취소 또는 포스트 삭제 시 걸린 코인을 신청자에게 돌려줍니다. 오래된 신청을 자동으로 정리하지는 않습니다.
 """
@@ -20,6 +20,13 @@ import activity
 logger = logging.getLogger("Chris-bot.bounty")
 
 CONTRIBUTION_MULTIPLIER = 2  # 기여 점수 = 걸린 코인 × 2 (주인 결정 2026-11-12)
+BASE_CONTRIBUTION = 10  # 현상금이 없거나 적어도 받는 기본 기여 점수 (주인 요청 2026-11-14)
+
+
+def contribution_points(amount: int) -> int:
+    """처리자가 받는 기여 점수: 걸린 코인 × 2, 최소 10점.
+    현상금 없는 작업도 10점을 받고, 1~4코인 현상금이 현상금 없는 작업보다 점수가 적어지지 않도록 최소값으로 둠."""
+    return max(amount * CONTRIBUTION_MULTIPLIER, BASE_CONTRIBUTION)
 HISTORY_SCAN_LIMIT = 3000  # 처리자 후보를 찾을 때 포스트에서 훑어볼 최대 메시지 수
 CUR = activity.CURRENCY_NAME
 EMOJI = activity.CURRENCY_EMOJI
@@ -120,7 +127,7 @@ def complete_request(thread_id: int, guild_id: int, solver_id: int) -> Optional[
     if req is None or req["status"] != "open":
         return None
     amount = req["amount"]
-    points = amount * CONTRIBUTION_MULTIPLIER
+    points = contribution_points(amount)
     conn.execute(
         "UPDATE bounty_requests SET status = 'done', solver_id = ?, closed_at = ? WHERE thread_id = ? AND status = 'open'",
         (solver_id, _now(), thread_id),
@@ -225,7 +232,7 @@ async def _announce_completion(thread: discord.Thread, solver: discord.abc.User,
             f"기여 점수 **{points}점**을 받았습니다."
         )
     else:
-        text = f"✅ **작품 처리 완료!** 처리자: {solver.mention}님 *(걸린 {CUR}이 없어 지급된 보상은 없습니다)*"
+        text = f"✅ **작품 처리 완료!** 처리자 {solver.mention}님이 기여 점수 **{points}점**을 받았습니다. *(걸린 {CUR} 없음)*"
     if by_admin:
         text += " *(관리자 처리)*"
     try:
@@ -274,9 +281,9 @@ class SolverSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         solver = self.candidates[int(self.values[0])]
         reward = (
-            f"현상금 **{self.amount} {CUR}**과 기여 점수 **{self.amount * CONTRIBUTION_MULTIPLIER}점**을 받습니다."
+            f"현상금 **{self.amount} {CUR}**과 기여 점수 **{contribution_points(self.amount)}점**을 받습니다."
             if self.amount
-            else f"걸린 {CUR}이 없어 보상은 없습니다."
+            else f"걸린 {CUR}이 없어 기여 점수 **{contribution_points(0)}점**만 받습니다."
         )
         await interaction.response.edit_message(
             content=f"**{solver.mention}님**을 처리자로 확정할까요? {reward}\n*(확정하면 되돌릴 수 없습니다)*",
